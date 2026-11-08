@@ -68,23 +68,49 @@ PLANS = {
 PLAN_DAYS = 30
 
 # ============================ KENGAYTIRILGAN MODERATSIYA ============================
-PROFANITY_WORDS = [
-    "ahmoq", "itvachcha", "jalap", "haromi", "iflos", "padariga", "suka", "blyat", "naxuy", "nahuy",
-    "dalbayob", "dalbayop", "chmo", "lox", "tupoy", "tentak", "mol", "eshak", "onangni", "onang",
-    "sikay", "sikaman", "qotoq", "qo'toq", "gandon", "pedik", "xuy", "pizda", "blya", "shilta",
-    "eblan", "chort", "maraz", "padar", "qanjiq", "foxisha", "geyporn", "porno"
+ROOT_PROFANITIES = [
+    r"(?:pashol\s*|di\s*|poshol\s*)?na[hx]u[yj]\w*",
+    r"dalba(?:yo|ye|e|o)[bp]\w*",
+    r"sik[a-z0-9']*\w*",
+    r"q[o']?toq\w*",
+    r"gandon\w*",
+    r"jalap\w*",
+    r"chort\w*",
+    r"[ye]iban\w*",
+    r"eblan\w*",
+    r"bl[ya]+[td]?\w*",
+    r"suk[ai]\w*",
+    r"haromi\w*",
+    r"onang[nd]i\w*",
+    r"foxish[aa]\w*",
+    r"porno\w*",
+    r"pedik\w*",
+    r"pizd[ae]\w*",
+    r"shilta\w*",
+    r"qanjiq\w*",
 ]
 
-SCAM_PHRASES = [
-    "kuniga 500$", "kuniga 100$", "kuniga 1000$", "daromad 100%", "kunlik daromad", "investitsiya qiling",
-    "investitsiya qilib", "lichkaga yozing", "lichkaga o'ting", "pul ko'paytirish", "garantiyali daromad",
-    "vznos", "kriptovalyuta ko'paytirib", "kripto ko'paytirish", "pul tikib", "tez boyish", "sxema bor",
-    "adminman pul", "parolingizni", "1xbet", "stavka", "linebet", "melbet", "kazinolar", "kripto piramida",
-    "shuncha pul ishladim", "sarmoyasiz daromad lichi"
+STANDALONE_PROFANITIES = [
+    r"ahmoq\w*", r"itvachcha\w*", r"padariga\w*", r"chmo\w*", r"lox\w*",
+    r"tupoy\w*", r"tentak\w*", r"mol\b", r"eshak\w*", r"maraz\w*"
 ]
 
-PROFANITY_RE = re.compile(r"(?<!\w)(" + "|".join(map(re.escape, PROFANITY_WORDS)) + r")(?!\w)", re.I)
-SCAM_RE = re.compile(r"(" + "|".join(map(re.escape, SCAM_PHRASES)) + r")", re.I)
+PROFANITY_RE = re.compile(
+    r"(" + "|".join(ROOT_PROFANITIES) + r"|(?<!\w)(?:" + "|".join(STANDALONE_PROFANITIES) + r")(?!\w))",
+    re.I
+)
+
+SCAM_PATTERNS = [
+    r"kuniga\s*\d+\$?", r"kunlik\s*daromad", r"oyiga\s*\d+\$?",
+    r"daromad\s*100%", r"investitsiya\s*(?:qiling|qilib)?", r"lichkaga\s*(?:yozing|o'ting)?",
+    r"\blich\b", r"\blichka\b", r"pul\s*ko'paytirish", r"garantiyali\s*daromad",
+    r"vznos", r"kripto(?:valyuta)?\s*ko'paytir", r"pul\s*tikib", r"tez\s*boyish",
+    r"sxema\s*bor", r"tekinga\s*\d+\$?", r"tekin\s*pul", r"oson\s*pul",
+    r"adminman\s*pul", r"parolingizni", r"1xbet", r"stavka", r"linebet",
+    r"melbet", r"mostbet", r"kazinolar", r"kripto\s*piramida",
+    r"shuncha\s*pul\s*ishladim", r"sarmoyasiz\s*daromad"
+]
+SCAM_RE = re.compile(r"(" + "|".join(SCAM_PATTERNS) + r")", re.I)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -136,6 +162,9 @@ def init_db():
         ("detailed_prompt", "TEXT DEFAULT ''"),
         ("custom_hours", "TEXT DEFAULT ''"),
         ("polls_sent", "INTEGER DEFAULT 0"),
+        ("group_messages", "INTEGER DEFAULT 0"),
+        ("warnings", "INTEGER DEFAULT 0"),
+        ("bans", "INTEGER DEFAULT 0"),
     ]:
         try:
             db.execute(f"ALTER TABLE channels ADD COLUMN {col} {col_type}")
@@ -146,6 +175,7 @@ def init_db():
     # Baza boshlang'ich sozlamalari
     db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('card_number', ?)", (DEFAULT_CARD_NUMBER,))
     db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('card_owner', ?)", (DEFAULT_CARD_OWNER,))
+    db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('gemini_api_key', ?)", (GEMINI_API_KEY,))
     db.commit()
 
 init_db()
@@ -172,6 +202,41 @@ def get_card_info():
     num = r_num["value"] if r_num and r_num["value"] else DEFAULT_CARD_NUMBER
     owner = r_owner["value"] if r_owner and r_owner["value"] else DEFAULT_CARD_OWNER
     return num, owner
+
+
+def get_gemini_api_key():
+    try:
+        r = q("SELECT value FROM settings WHERE key='gemini_api_key'", one=True)
+        if r and r["value"]:
+            return r["value"].strip()
+    except Exception:
+        pass
+    return os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6I4Sl3rZXMyL5C1J6ANVNLFUbANDfJTRhno8pFKT0huEA").strip()
+
+
+def get_gemini_client():
+    key = get_gemini_api_key()
+    return genai.Client(api_key=key, http_options={"api_version": "v1beta"})
+
+
+async def test_gemini_key(key: str = None):
+    test_k = key.strip() if key else get_gemini_api_key()
+    if not test_k:
+        return False, "Kalit bo'sh!"
+    try:
+        test_client = genai.Client(api_key=test_k, http_options={"api_version": "v1beta"})
+        models_to_test = [GEMINI_MODEL, "gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest", "gemini-3-flash-preview"]
+        last_e = ""
+        for m in models_to_test:
+            try:
+                res = await test_client.aio.models.generate_content(model=m, contents="Test")
+                if res and (res.text or "").strip():
+                    return True, f"✅ Aloqa o'rnatildi! ({m} modeli javob berdi)"
+            except Exception as e:
+                last_e = str(e)
+        return False, f"Google xatosi: {last_e or 'Javob olinmadi'}"
+    except Exception as e:
+        return False, f"Ulanish xatosi: {e}"
 
 
 def get_user_plan(uid):
@@ -229,14 +294,25 @@ auto_restore_channels()
 # ============================ KANAL HAVOLALARINI TOZALASH ============================
 def clean_channel_input(text: str):
     text = text.strip()
+    m_c = re.search(r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/c/(\d+)", text)
+    if m_c:
+        cid = int(m_c.group(1))
+        return -int(f"100{cid}") if not str(cid).startswith("100") else -cid
     m = re.search(r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/+([a-zA-Z0-9_]+)", text)
     if m:
-        return "@" + m.group(1)
+        u = m.group(1)
+        if u not in ("joinchat", "c", "addstickers"):
+            return "@" + u
     if text.startswith("@"):
         return text
     if text.lstrip("-").isdigit():
-        return int(text)
-    return "@" + text
+        val = int(text)
+        if val > 0:
+            s = str(val)
+            return -int(s) if s.startswith("100") else -int(f"100{s}")
+        return val
+    clean = text.replace("https://", "").replace("http://", "").replace("t.me/", "").replace("/", "").strip()
+    return "@" + clean if not clean.startswith("@") else clean
 
 
 # ============================ KLAVIATURALAR ============================
@@ -298,6 +374,10 @@ class AdminCard(StatesGroup):
 
 class AdminRestore(StatesGroup):
     file = State()
+
+
+class AdminGemini(StatesGroup):
+    key = State()
 
 
 class Pay(StatesGroup):
@@ -467,6 +547,7 @@ async def buy(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
+@dp.message(F.text.casefold().in_({"cancel", "/cancel", "bekor", "bekor qilish", "❌ bekor qilish", "отмена", "/bekor"}))
 @dp.message(Command("cancel"))
 async def cancel(m: types.Message, state: FSMContext):
     await state.clear()
@@ -534,12 +615,14 @@ async def pay_decision(cb: types.CallbackQuery):
         await bot.send_message(pay["user_id"], note)
     except Exception:
         pass
-    await cb.message.edit_caption(caption=(cb.message.caption or "") + f"\n\n<b>{status}</b> ({cb.from_user.full_name})")
+    await cb.message.edit_caption(caption=(cb.message.caption or "") + f"\n\n<b>{status}</b> ({cb.from_user.full_name})", reply_markup=None)
     await cb.answer("Bajarildi!")
 
 
 # ============================ KANAL ULASH ============================
 async def is_admin_of(chat_id, user_id):
+    if user_id in ADMIN_IDS:
+        return True
     try:
         m = await bot.get_chat_member(chat_id, user_id)
         return m.status in ("administrator", "creator")
@@ -673,12 +756,12 @@ async def add_ch_group(m: types.Message, state: FSMContext):
 async def add_ch_hours(m: types.Message, state: FSMContext):
     txt = m.text.strip().lower()
     custom_hours = ""
-    if txt != "standart":
-        try:
-            hrs = [int(x.strip()) for x in txt.split(",") if 0 <= int(x.strip()) <= 23]
-            if hrs:
-                custom_hours = ",".join(map(str, sorted(set(hrs))))
-        except Exception:
+    if txt not in ("standart", "standart rejim", "default"):
+        raw_nums = re.findall(r"\b([0-1]?[0-9]|2[0-3])\b", txt)
+        hrs = [int(x) for x in raw_nums if 0 <= int(x) <= 23]
+        if hrs:
+            custom_hours = ",".join(map(str, sorted(set(hrs))))
+        else:
             return await m.answer("⚠️ Iltimos, soatlarni to'g'ri kiriting (masalan: <code>9, 14, 20</code>) yoki «standart» deb yozing:")
     
     d = await state.get_data()
@@ -840,13 +923,13 @@ async def edit_hours_finish(m: types.Message, state: FSMContext):
     cid = d["cid"]
     txt = m.text.strip().lower()
     custom_hours = ""
-    if txt != "standart":
-        try:
-            hrs = [int(x.strip()) for x in txt.split(",") if 0 <= int(x.strip()) <= 23]
-            if hrs:
-                custom_hours = ",".join(map(str, sorted(set(hrs))))
-        except Exception:
-            return await m.answer("⚠️ Iltimos, soatlarni to'g'ri kiriting (masalan: <code>9, 14, 21</code>):")
+    if txt not in ("standart", "standart rejim", "default"):
+        raw_nums = re.findall(r"\b([0-1]?[0-9]|2[0-3])\b", txt)
+        hrs = [int(x) for x in raw_nums if 0 <= int(x) <= 23]
+        if hrs:
+            custom_hours = ",".join(map(str, sorted(set(hrs))))
+        else:
+            return await m.answer("⚠️ Iltimos, soatlarni to'g'ri kiriting (masalan: <code>9, 14, 21</code>) yoki «standart» deb yozing:")
     
     q("UPDATE channels SET custom_hours=? WHERE channel_id=?", (custom_hours, cid), commit=True)
     auto_backup_channels()
@@ -893,13 +976,13 @@ async def edit_grp_finish(m: types.Message, state: FSMContext):
     await m.answer(f"✅ <b>Guruh muvaffaqiyatli yangilandi:</b> <code>{group_id or 'Olib tashlandi'}</code>", reply_markup=MENU)
 
 
-# ============================ PROFESSIONAL AI GENERATOR (100% KAFOLATLI) ============================
+# ============================ PROFESSIONAL AI GENERATOR (100% KAFOLATLI VA KANALGA MOS) ============================
 POST_THEMES = [
-    "real_cases",       # Kim qanday bot/sayt qilib sotdi, real loyiha tajribalari
-    "free_tools",       # Tekin xostinglar (Render, PythonAnywhere, Railway, Vercel), sayt platformalari
-    "youtube_learning", # YouTube darsliklari, foydali veb-manbalar (onadek g'amxo'r tilda o'rgatuvchi)
-    "interactive_game", # Qiziqarli mantiqiy o'yin, topishmoq, auditoriya bilan test
-    "funny_memes",      # Hayotiy IT / sohaviy mem, kulgili voqea va kayfiyat ko'taruvchi post
+    "real_cases",       # Real loyihalar, keyslar, natija va muvaffaqiyat tajribalari
+    "free_tools",       # Bepul asboblar, foydali platformalar va tekin vositalar
+    "youtube_learning", # YouTube darsliklari, amaliy bilimlar (onadek/ustozdek g'amxo'r tilda)
+    "interactive_game", # Qiziqarli mantiqiy savol, sohaviy topishmoq yoki test
+    "funny_memes",      # Hayotiy kulgili voqea, mutaxassislar uchraydigan qiziqarli hazil
     "expert_guide"      # Kanal mavzusiga oid amaliy professional qo'llanma
 ]
 
@@ -912,43 +995,296 @@ IMAGE_STYLES = [
     "cozy vintage retro tech atmosphere, warm tones, high quality photography"
 ]
 
-FALLBACK_POSTS = {
-    "real_cases": (
-        "<b>🚀 Real Keys: Qanday qilib oddiy Telegram bot yaratib sotildi?</b>\n\n"
-        "Ko'pchilik katta dasturchi bo'lmasdan turib daromadli loyiha qilib bo'lmaydi deb o'ylaydi. "
-        "Lekin yaqinda bir yosh dasturchi oddiy <i>restoran buyurtma boti</i>ni yasab, bir nechta kafelarga "
-        "oylik obuna sifatida taqdim etdi! 💡\n\n"
-        "📌 <b>Asosiy xulosa:</b> Katta narsani kutib o'tirmang! Hatto oddiy, lekin odamlar dardini yengillatadigan "
-        "kichik loyiha ham katta imkoniyatlar eshigini ochadi.\n\n"
-        "⚡️ Sizlar ham o'zingizcha biror g'oya o'ylab ko'ring, yaratib ko'ring! Sizda qanday loyiha g'oyasi bor? 👇"
-    ),
-    "free_tools": (
-        "<b>🛠 Telegram botlarni qayerga TEKIN xostingga qo'yish mumkin?</b>\n\n"
-        "Kompyuteringizni 24/7 yoqib o'tirish shart emas. Botingizni bepul serverlarga joylashtiring:\n\n"
-        "1. <b>Render.com</b> — Background Worker yoki Web Service orqali 24/7 bepul ishlatish mumkin.\n"
-        "2. <b>PythonAnywhere.com</b> — Python botlar va skriptlar uchun eng qulay bepul xosting.\n"
-        "3. <b>Railway.app & Koyeb</b> — Tezkor va zamonaviy konteyner xostinglari.\n\n"
-        "💡 Boshlanishiga ushbu platformalar sizga 100% yetadi. Sinab ko'rganmisiz? 🚀"
-    ),
-    "youtube_learning": (
-        "<b>🎥 Bilim olish vaqti: YouTube'dan nimalarni o'rganish kerak?</b>\n\n"
-        "Aziz do'stlar, xuddi mehribon ustozingizdek sizga samimiy maslahat bermoqchiman: "
-        "Internet — bepul bilimlar xazinasi! Vaqtingizni bekorchi videolarga emas, o'z ustingizda ishlashga sarflang ✨\n\n"
-        "📌 <b>Tavsiya qilinadigan qidiruv mavzulari:</b>\n"
-        "• <code>Telegram bot yaratish noldan aiogram 3</code>\n"
-        "• <code>Python dasturlash asoslari to'liq kurs</code>\n"
-        "• <code>Web-sayt yaratish va internet loyihalar</code>\n\n"
-        "Kuniga atigi 30 daqiqa video ko'rib amaliyot qilsangiz, bir oyda natijangizni tanimay qolasiz! 📈"
-    ),
-    "expert_guide": (
-        "<b>💎 Professional Maslahat: Muvaffaqiyatli kanal va loyiha sirlari</b>\n\n"
-        "Har qanday sohada yuqori natijaga erishishning 3 ta oltin qoidasi:\n\n"
-        "1. <b>Doimiylik (Intizom)</b> — Har kuni kichik qadam tashlash, bir kunda hamma narsani qilishdan afzal.\n"
-        "2. <b>Foyda berish</b> — Auditoriyangizga eng toza va amaliy ma'lumotni ulashing.\n"
-        "3. <b>Xatodan qo'rqmaslik</b> — Har bir xato bu yangi tajriba!\n\n"
-        "Bugun o'z maqsadingiz sari qanday qadam tashladingiz? 🎯"
-    )
-}
+
+def generate_niche_adaptive_post_and_poll(c, theme=None):
+    """
+    Kanal yo'nalishi (niche), sarlavhasi (title) va promptiga 100% moslashuvchan,
+    YouTube darslik havolasi va maxsus so'rovnomaga ega professional generator.
+    AI kalit ishlamagan taqdirda ham kanallar bir-birini hech qachon takrorlamaydi!
+    """
+    title = (c.get("title") or "Kanalimiz").strip()
+    niche = (c.get("niche") or "Foydali bilimlar va amaliyot").strip()
+    detailed = (c.get("detailed_prompt") or "").strip()
+    
+    if not theme or theme not in POST_THEMES:
+        theme = random.choice(POST_THEMES)
+        
+    n_lower = f"{niche} {detailed}".lower()
+    
+    # 1. Trading / Kripto
+    if any(k in n_lower for k in ["treding", "trading", "kripto", "crypto", "forex", "valyuta", "scalping", "invest", "aksiya", "bozor"]):
+        yt_query = "kripto va trading darslari uzbek"
+        yt_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(yt_query)}"
+        img_prompt = "professional modern financial trading desk multiple monitors glowing cryptocurrency candlestick charts dark mode 8k resolution"
+        
+        posts = {
+            "real_cases": (
+                f"🚀 <b>Real Keys: Kichik depozitdan intizom bilan natijaga chiqish!</b>\n\n"
+                f"Ko'pchilik treydingda bitta bitim bilan boyib ketishni orzu qiladi va bor pulini yo'qotadi. "
+                f"Lekin yaqinda bir treyder har bir bitimda atigi <b>1-2% risk</b> qilib, qat'iy reja bilan 3 oyda hisobini barqaror 40% ga o'stirdi! 💡\n\n"
+                f"📌 <b>Asosiy xulosa:</b> Treyding — bu omad o'yini emas, bu <b>ehtimollar va intizom</b> matematikasi.\n\n"
+                f"🎥 <b>Tavsiya darslik:</b> <a href=\"{yt_url}\">YouTube'da bepul trading darslarini tomosha qiling</a>\n\n"
+                f"⚡️ <i>Sizlar ham o'zingizcha biror strategiyani sinab ko'ring! Bugun qaysi juftlikni kuzatyapsiz?</i> 👇"
+            ),
+            "free_tools": (
+                f"🛠 <b>Treyding uchun eng zo'r BEPUL asboblar:</b>\n\n"
+                f"Grafik va bozor tahlili uchun qimmat dasturlar shart emas. Bepul vositalardan unumli foydalaning:\n\n"
+                f"1. <b>TradingView</b> — Eng kuchli grafiklar, indikatorlar va tahlil maydoni.\n"
+                f"2. <b>CoinMarketCap / CoinGecko</b> — Kriptovalyutalar kapitallashuvi va likvidlik ko'rsatkichlari.\n"
+                f"3. <b>CryptoPanic</b> — Eng qaynoq bozor yangiliklari bitta tasmasida.\n"
+                f"4. <b>Notion / Google Sheets</b> — Xatolarni tahlil qilish uchun shaxsiy savdo jurnali.\n\n"
+                f"🎥 <b>Qo'llanma:</b> <a href=\"{yt_url}\">YouTube'da instrumentlardan foydalanish darslari</a>\n\n"
+                f"💡 <i>Siz ko'proq qaysi platformada tahlil qilasiz?</i> 🚀"
+            ),
+            "youtube_learning": (
+                f"🎥 <b>Bilim olish vaqti: Treyding bo'yicha YouTube'dagi oltin tavsiyalar!</b>\n\n"
+                f"Aziz do'stlar, xuddi mehribon ustozingizdek sizga samimiy maslahat bermoqchiman: "
+                f"Treydingda muvaffaqiyat qozonish uchun shoshilmang, avval bilim oling! ✨\n\n"
+                f"📌 <b>O'rganish kerak bo'lgan eng zarur mavzular:</b>\n"
+                f"• <code>Texnik tahlil va shamchalar (Candlestick) signallari</code>\n"
+                f"• <code>Risk va Money Management (Kapitalni asrash)</code>\n"
+                f"• <code>Treyding psixologiyasi va FOMO bilan kurashish</code>\n\n"
+                f"👉 <a href=\"{yt_url}\">🎥 YouTube'da ushbu mavzular bo'yicha darsliklarni ko'rish</a>\n\n"
+                f"<i>Kuniga 30 daqiqa amaliyot qilsangiz, bir oyda natijangiz mutlaqo boshqacha bo'ladi!</i> 📈"
+            ),
+            "interactive_game": (
+                f"🎮 <b>Mantiqiy savol: Qaysi treyder oxir-oqibat g'olib bo'ladi?</b>\n\n"
+                f"Tasavvur qiling, bozorda 2 xil treyder bor:\n"
+                f"A) Bitimlarining 80%i to'g'ri chiqadi, lekin Stop-loss qo'ymaydi.\n"
+                f"B) Bitimlarining atigi 45%i to'g'ri chiqadi, lekin har doim 1:3 risk/reward va qat'iy Stop-loss bilan ishlaydi.\n\n"
+                f"Sizningcha, 6 oydan keyin qaysi biri daromadda bo'ladi? O'z javobingizni izohda yozib qoldiring! 👇"
+            ),
+            "funny_memes": (
+                f"😂 <b>Treyder hayotidan qiziqarli lahza:</b>\n\n"
+                f"— Grafikka 3 soat tikilib «Hozir uchadi» deb sotib oldim: darhol pastga quladi! 📉\n"
+                f"— Chidolmay sotsam: raketadek tepaga uchib ketdi! 🚀\n\n"
+                f"Tanish holatmi? Bu bozorning odatiy sinovi! Muhimi — emotsiyaga berilmaslik va sabr qilish 🧘‍♂️"
+            ),
+            "expert_guide": (
+                f"💎 <b>Ekspert Maslahati: Treydingda depozitni saqlab qolishning 3 oltin qoidasi</b>\n\n"
+                f"1. <b>Bitta bitimga butun depozitni tikmang</b> — Har qanday sharoitda 1-2% risk qoidasiga amal qiling.\n"
+                f"2. <b>Stop-loss'siz bozorga kirmang</b> — Qabul qilinadigan zararni oldindan belgilang.\n"
+                f"3. <b>FOMO (ortda qolish qo'rquviga) uchmang</b> — O'tib ketgan imkoniyat ortidan quvmang, yangisi albatta keladi.\n\n"
+                f"🎥 <b>Tavsiya:</b> <a href=\"{yt_url}\">YouTube'da amaliy master-klass darslarini ko'rish</a>"
+            )
+        }
+        
+        poll_q_list = [
+            "Siz treydingda eng ko'p qaysi uslubni qo'llaysiz? 📊",
+            "Treydingda siz uchun eng katta qiyinchilik nima? 🤔",
+            "Bozorda risk-menejmentga (1-2% risk) qat'iy amal qilasizmi? ⚖️"
+        ]
+        poll_opts_list = [
+            ["Spot savdo (Uzoq muddat) 📈", "Scalping va tezkor savdo ⚡️", "Texnik tahlil va Smart Money 🧠", "Hali o'rganish bosqichidaman 📚"],
+            ["Emotsiyani jilovlash (Sabr) 🧘‍♂️", "To'g'ri kirish nuqtasi topish 🎯", "Stop-loss intizomi ⏳", "Bozor tahlili 📉"],
+            ["Ha, har bir bitimda riskni hisoblayman ✅", "Ba'zida emotsiyaga berilaman 😅", "Yo'q, stop-loss ishlatmayman ❌", "O'rganishim kerak 📝"]
+        ]
+
+    # 2. IT / Botlar / Web / Dasturlash
+    elif any(k in n_lower for k in ["bot", "sayt", "dastur", "python", "web", "kod", "developer", "it", "xosting"]):
+        yt_query = "telegram bot yaratish va python darslari noldan"
+        yt_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(yt_query)}"
+        img_prompt = "modern high-tech software engineer workstation dual monitors glowing code python terminal ambient neon lighting 8k resolution"
+        
+        posts = {
+            "real_cases": (
+                f"🚀 <b>Real Keys: Qanday qilib oddiy Telegram bot yaratib sotildi?</b>\n\n"
+                f"Ko'pchilik katta dasturchi bo'lmasdan turib daromadli loyiha qilib bo'lmaydi deb o'ylaydi. "
+                f"Lekin yaqinda bir yosh dasturchi oddiy <i>restoran buyurtma boti</i>ni yasab, bir nechta kafelarga "
+                f"oylik obuna sifatida taqdim etdi va barqaror daromadga chiqdi! 💡\n\n"
+                f"📌 <b>Asosiy xulosa:</b> Katta narsani kutib o'tirmang! Hatto oddiy, lekin odamlar dardini yengillatadigan "
+                f"kichik loyiha ham katta imkoniyatlar eshigini ochadi.\n\n"
+                f"🎥 <b>Tavsiya darslik:</b> <a href=\"{yt_url}\">YouTube'da bot yaratish bo'yicha bepul darsliklar</a>\n\n"
+                f"⚡️ <i>Sizlar ham o'zingizcha biror g'oya o'ylab ko'ring, yaratib ko'ring! Sizda qanday loyiha g'oyasi bor?</i> 👇"
+            ),
+            "free_tools": (
+                f"🛠 <b>Telegram botlarni qayerga TEKIN xostingga qo'yish mumkin?</b>\n\n"
+                f"Kompyuteringizni 24/7 yoqib o'tirish shart emas. Botingizni bepul serverlarga joylashtiring:\n\n"
+                f"1. <b>Render.com</b> — Background Worker yoki Web Service orqali 24/7 bepul ishlatish mumkin.\n"
+                f"2. <b>PythonAnywhere.com</b> — Python botlar va skriptlar uchun eng qulay bepul xosting.\n"
+                f"3. <b>Railway.app & Koyeb</b> — Tezkor va zamonaviy konteyner xostinglari.\n"
+                f"4. <b>GitHub</b> — Loyihangiz kodini xavfsiz saqlash va Renderga ulash uchun.\n\n"
+                f"🎥 <b>Ko'rsatma:</b> <a href=\"{yt_url}\">YouTube'da bepul serverga bot yuklash darslari</a>\n\n"
+                f"💡 <i>Boshlanishiga ushbu platformalar sizga 100% yetadi. Sinab ko'rganmisiz?</i> 🚀"
+            ),
+            "youtube_learning": (
+                f"🎥 <b>Bilim olish vaqti: YouTube'dan nimalarni o'rganish kerak?</b>\n\n"
+                f"Aziz do'stlar, xuddi mehribon ustozingizdek sizga samimiy maslahat bermoqchiman: "
+                f"Internet — bepul bilimlar xazinasi! Vaqtingizni bekorchi videolarga emas, o'z ustingizda ishlashga sarflang ✨\n\n"
+                f"📌 <b>Tavsiya qilinadigan qidiruv mavzulari:</b>\n"
+                f"• <code>Telegram bot yaratish noldan aiogram 3</code>\n"
+                f"• <code>Python dasturlash asoslari to'liq kurs</code>\n"
+                f"• <code>Web-sayt yaratish va internet loyihalar</code>\n\n"
+                f"👉 <a href=\"{yt_url}\">🎥 YouTube'da ushbu bepul darsliklarni tomosha qiling</a>\n\n"
+                f"<i>Kuniga atigi 30 daqiqa video ko'rib amaliyot qilsangiz, bir oyda natijangizni tanimay qolasiz!</i> 📈"
+            ),
+            "interactive_game": (
+                f"🎮 <b>Dasturchilar va foydalanuvchilar uchun qiziqarli mantiqiy topishmoq:</b>\n\n"
+                f"Kodni qanchalik tez o'qiysiz?\n"
+                f"<code>x = [1, 2, 3]\ny = x\ny.append(4)\nprint(len(x))</code>\n\n"
+                f"Ekranga qanday natija chiqadi: <b>3</b>mi yoki <b>4</b>? Izohda o'z javobingizni qoldiring! 💡"
+            ),
+            "funny_memes": (
+                f"😂 <b>Dasturchilar hayotidan kulgili holat:</b>\n\n"
+                f"— «Dasturim kompyuterimda ideal ishlayotgan edi!»\n"
+                f"— Serverga yuklaganimdan so'ng: <i>Error 500 / Crash</i> 😅\n\n"
+                f"Haqiqiy dasturchi xatolardan qo'rqmaydi, loglarni o'qib darhol tuzatadi! Har qanday xato yangi tajriba beradi 🚀"
+            ),
+            "expert_guide": (
+                f"💎 <b>Professional Maslahat: Qanday qilib birinchi IT loyihani sotish mumkin?</b>\n\n"
+                f"1. <b>Atrofdagi muammolarni qidiring</b> — Do'kon, kafe yoki kurslar uchun buyurtma/ro'yxatdan o'tish boti qilib bering.\n"
+                f"2. <b>Bepul namuna qiling</b> — «Sizga bepul 3 kun sinov boti ulab beraman, yoqsa davom ettirasiz» deng.\n"
+                f"3. <b>Soddalikni saqlang</b> — Murakkab funksiyalardan ko'ra, tez va aniq ishlaydigan yechim qadrliroq.\n\n"
+                f"🎥 <b>Tavsiya:</b> <a href=\"{yt_url}\">YouTube'da loyiha yaratish darslari</a>"
+            )
+        }
+        
+        poll_q_list = [
+            "Kanalimizda navbatdagi amaliy dars qaysi mavzuda bo'lsin? 🚀",
+            "Botingiz yoki veb-saytingizni bepul xostingga qo'yganmisiz? 🌐",
+            "Siz ko'proq qaysi yo'nalishga qiziqasiz? 💻"
+        ]
+        poll_opts_list = [
+            ["Telegram botlar va Python 🤖", "Web-saytlar va Frontend 💻", "Sun'iy intellekt (AI) integratsiyasi ⚡️", "Real keyslar va sotish sirlari 💡"],
+            ["Ha, Render/PythonAnywhere ishlataman ✅", "Yo'q, hali bilmayman 🤔", "Kompyuterimda ishlaydi 💻", "Tekin xosting qo'llanmasi kerak 📝"],
+            ["Backend va botlar ⚙️", "Frontend va saytlar 🎨", "AI va Data Science 🧠", "IT loyihalarni sotish va biznes 💰"]
+        ]
+
+    # 3. Biznes / Startap / Savdo
+    elif any(k in n_lower for k in ["biznes", "startap", "savdo", "marketing", "mijoz", "sotuv", "daromad"]):
+        yt_query = "biznes boshlash va daromad sirlari noldan"
+        yt_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(yt_query)}"
+        img_prompt = "modern minimalist business executive office glass windows city skyline confident entrepreneur working on laptop 8k"
+        
+        posts = {
+            "real_cases": (
+                f"🚀 <b>Real Keys: 0 so'm xarajat bilan xizmat ko'rsatish biznesini boshlash!</b>\n\n"
+                f"Ko'pchilik biznes uchun katta mablag' kerak deb boshlashni kechiktiradi. "
+                f"Lekin bir tadbirkor shunchaki o'z sohasidagi mijozlarni topib, pudratchi mutaxassislar bilan "
+                f"bog'lash (vositachilik) orqali hech qanday boshlang'ich pulsiz daromadli biznes modelini yo'lga qo'ydi! 💡\n\n"
+                f"📌 <b>Asosiy xulosa:</b> Eng muhimi kapital emas, balki <b>mijoz topish va muammosini hal qilish</b> qobiliyati.\n\n"
+                f"🎥 <b>Tavsiya darslik:</b> <a href=\"{yt_url}\">YouTube'da biznes va startap darslari</a>\n\n"
+                f"⚡️ <i>Sizlar ham o'zingizcha biror g'oya o'ylab ko'ring, yaratib ko'ring! Sizda qanday biznes g'oya bor?</i> 👇"
+            ),
+            "free_tools": (
+                f"🛠 <b>Biznes va startap uchun eng foydali BEPUL vositalar:</b>\n\n"
+                f"1. <b>Notion & Trello</b> — Loyihalarni, rejalarni va vazifalarni tizimli boshqarish.\n"
+                f"2. <b>Canva</b> — Sifatli reklama bannerlari va taqdimotlar tayyorlash.\n"
+                f"3. <b>Google Sheets & Forms</b> — Mijozlar bazasi va so'rovnomalarni qulay yuritish.\n"
+                f"4. <b>Telegram kanallar va guruhlar</b> — Bepul organik auditoriya to'plash maydoni.\n\n"
+                f"🎥 <b>Qo'llanma:</b> <a href=\"{yt_url}\">YouTube'da biznes asboblari bo'yicha darslar</a>"
+            ),
+            "youtube_learning": (
+                f"🎥 <b>Bilim olish vaqti: Biznes va marketing sirlarini o'rganing!</b>\n\n"
+                f"Aziz do'stlar, xuddi mehribon ustozingizdek sizga samimiy maslahat bermoqchiman: "
+                f"Zamonaviy dunyoda eng qimmat ko'nikma — bu sotish, marketing va muzokara olib borishdir! ✨\n\n"
+                f"👉 <a href=\"{yt_url}\">🎥 YouTube'da biznes va savdoni rivojlantirish darslari</a>\n\n"
+                f"<i>Kuniga bittadan amaliy keysni tahlil qiling va o'z faoliyatingizga tadbiq eting!</i> 📈"
+            ),
+            "interactive_game": (
+                f"🎮 <b>Biznes topishmoq: Qaysi mahsulot ko'proq sotiladi?</b>\n\n"
+                f"A) Narxi juda arzon, lekin hech kim bilmaydigan zo'r mahsulot.\n"
+                f"B) Narxi o'rtacha, lekin aniq auditoriya muammosini hal qiluvchi kuchli reklama qilingan mahsulot.\n\n"
+                f"Sizningcha, uzoq muddatda qaysi biri bozor yetakchisiga aylanadi? Izohda fikringizni yozing! 💡"
+            ),
+            "funny_memes": (
+                f"😂 <b>Biznesdagi kulgili hayotiy holat:</b>\n\n"
+                f"— «Ertadan yangi loyihani boshlayman, biznes reja tayyor!»\n"
+                f"— 3 oydan so'ng: Hali ham biznes rejani mukammallashtirib o'tiribdi... 😅\n\n"
+                f"Mukammallikni kutmang, hoziroq harakatni boshlang! Haqiqiy natija faqat amaliyotda keladi 🚀"
+            ),
+            "expert_guide": (
+                f"💎 <b>Ekspert Maslahati: Yangi loyihada mijozlarni jalb qilishning 3 qoidasi</b>\n\n"
+                f"1. <b>Mijoz dardiga e'tibor bering</b> — Mahsulotingiz emas, u beradigan foyda sotadi.\n"
+                f"2. <b>Ochiq muloqot va ishonch</b> — Mijozlar bilan samimiy munosabat o'rnating.\n"
+                f"3. <b>Doimiy sinov (A/B testing)</b> — Har xil takliflarni sinab ko'ring va eng yaxshisini tanlang."
+            )
+        }
+        
+        poll_q_list = [
+            "Biznes yoki startap boshlashda siz uchun eng katta to'siq nima? 💡",
+            "Mijozlarni jalb qilishda eng samarali usul qaysi deb o'ylaysiz? 📢",
+            "Shaxsiy loyihangizni qachon ishga tushirmoqchisiz? 🚀"
+        ]
+        poll_opts_list = [
+            ["Boshlang'ich kapital topish 💰", "Mijozlarni jalb qilish (Marketing) 📢", "To'g'ri g'oya tanlash 🎯", "Jamoa va intizom ⏳"],
+            ["Telegram va ijtimoiy tarmoqlar 📱", "Tavsiyalar (Sarafan marketing) 🤝", "Target va to'g'ridan-to'g'ri reklama 🎯", "Shaxsiy brend va blog yuritish ✨"],
+            ["Hozirda faol ishlayapman 🔥", "Shu oy ichida boshlayman 🚀", "Hali rejalashtiryapman 🤔", "G'oya qidiryapman 💡"]
+        ]
+
+    # 4. Universal / Boshqa sohalar
+    else:
+        yt_query = f"{niche} o'rganish va amaliy darslar"
+        yt_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(yt_query)}"
+        img_prompt = f"high quality editorial photograph inspiring atmosphere related to {niche} clean natural lighting 8k resolution"
+        
+        posts = {
+            "real_cases": (
+                f"🚀 <b>Real Keys: «{html.escape(niche)}» sohasida qanday qilib yuqori natijaga erishildi?</b>\n\n"
+                f"Ko'pchilik katta natijalarga birdaniga erishiladi deb o'ylaydi. Lekin tajriba shuni ko'rsatadiki, "
+                f"har kuni qo'yilgan kichik va qat'iy qadamlar bir necha oy ichida aqlbovar qilmas natijalarni beradi! 💡\n\n"
+                f"📌 <b>Asosiy xulosa:</b> Doimiylik va to'g'ri yo'nalish har qanday murakkab maqsadni osonlashtiradi.\n\n"
+                f"🎥 <b>Tavsiya darslik:</b> <a href=\"{yt_url}\">YouTube'da bepul darslik va amaliyotlarni ko'rish</a>\n\n"
+                f"⚡️ <i>Sizlar ham o'zingizcha biror g'oya o'ylab ko'ring, yaratib ko'ring! Sizning maqsadingiz nima?</i> 👇"
+            ),
+            "free_tools": (
+                f"🛠 <b>«{html.escape(niche)}» yo'nalishida eng foydali BEPUL asboblar:</b>\n\n"
+                f"1. <b>Internet platformalari</b> — Bepul onlayn kurslar va tahliliy maqolalar.\n"
+                f"2. <b>Zamonaviy ilovalar</b> — Kundalik amaliyot va jarayonlarni soddalashtiruvchi vositalar.\n"
+                f"3. <b>YouTube video darsliklari</b> — Dunyoning eng tajribali mutaxassislari tajribalari.\n\n"
+                f"🎥 <b>Qo'llanma:</b> <a href=\"{yt_url}\">YouTube'da ushbu mavzu bo'yicha darslar</a>"
+            ),
+            "youtube_learning": (
+                f"🎥 <b>Bilim olish vaqti: YouTube'dagi eng foydali yo'nalishlar!</b>\n\n"
+                f"Aziz do'stlar, xuddi mehribon ustozingizdek sizga samimiy maslahat bermoqchiman: "
+                f"O'z sohangizda mutaxassis bo'lish uchun har kuni yangi bilim o'rganishdan to'xtamang! ✨\n\n"
+                f"👉 <a href=\"{yt_url}\">🎥 YouTube'da ushbu yo'nalish darsliklarini tomosha qiling</a>\n\n"
+                f"<i>Kuniga 30 daqiqa video ko'rib amaliyot qilsangiz, tez orada natijalar o'z so'zini aytadi!</i> 📈"
+            ),
+            "interactive_game": (
+                f"🎮 <b>Auditoriya uchun qiziqarli savol va fikr almashish:</b>\n\n"
+                f"«{html.escape(niche)}» yo'nalishida sizningcha eng muhimi nima:\n"
+                f"A) Chuqur nazariy bilim va qoidalar.\n"
+                f"B) Har kuni tinimsiz amaliyot qilish va tajriba orttirish.\n\n"
+                f"O'z fikringizni izohlarda yozib qoldiring! 👇"
+            ),
+            "funny_memes": (
+                f"😂 <b>Hayotiy kulgili haqiqat:</b>\n\n"
+                f"— «Hamma narsani rejalashtirib qo'ydim, dushanbadan 100% boshlayman!»\n"
+                f"— Dushanba kuni: <i>Yana bir haftadan boshlasamchi?</i> 😅\n\n"
+                f"Dushanbani kutmang, hoziroq birinchi qadamni tashlang! Harakatda baraka bor 🚀"
+            ),
+            "expert_guide": (
+                f"💎 <b>Professional Maslahat: Muvaffaqiyatga eltuvchi 3 oltin qoida</b>\n\n"
+                f"1. <b>Doimiylik (Intizom)</b> — Har kuni kichik bo'lsa ham amaliyot qiling.\n"
+                f"2. <b>Sifatli manbalar</b> — Eng ishonchli va toza ma'lumotlarni o'rganing.\n"
+                f"3. <b>Xatolar bilan ishlash</b> — Xatodan xulosa chiqarib, yanada kuchliroq davom eting.\n\n"
+                f"🎥 <b>Tavsiya:</b> <a href=\"{yt_url}\">YouTube'da foydali darsliklarni ko'rish</a>"
+            )
+        }
+        
+        poll_q_list = [
+            f"«{html.escape(title)}» kanalimizda qaysi mavzuni ko'proq yoritishimizni xohlaysiz? 💡",
+            f"«{html.escape(niche[:40])}» yo'nalishida hozirgi darajangiz qanday? 📊",
+            "Kanalimizdagi navbatdagi post qanday formatda bo'lsin? ✨"
+        ]
+        poll_opts_list = [
+            ["Amaliy qo'llanmalar 📚", "Real muvaffaqiyat keyslari 💡", "Bepul vositalar va tavsiyalar 🛠", "Video darsliklar tavsiyasi 🎥"],
+            ["Endi boshlayapman (Boshlovchi) 🌱", "O'rtacha darajada bilaman 📈", "Tajribam yetarli (Professional) 🎯", "Shunchaki qiziqaman 👀"],
+            ["Batafsil mini-qo'llanma 📝", "Qiziqarli keys / Tarix 💡", "Mantiqiy savol / O'yin 🎮", "Foydali video tavsiya 🎥"]
+        ]
+
+    post_text = posts.get(theme) or posts.get("expert_guide") or list(posts.values())[0]
+    idx = random.randint(0, len(poll_q_list) - 1)
+    poll_q = poll_q_list[idx]
+    poll_opts = poll_opts_list[idx]
+    
+    return {
+        "post_text": post_text,
+        "image_prompt": img_prompt,
+        "poll_question": poll_q,
+        "poll_options": poll_opts
+    }
 
 
 async def get_recent_chat_insights(channel_id):
@@ -958,7 +1294,7 @@ async def get_recent_chat_insights(channel_id):
     return "\n".join(f"- {r['user_name'] or 'A`zo'}: {r['text']}" for r in rows)
 
 
-def extract_post_from_text(raw_text: str, fallback_theme: str):
+def extract_post_from_text(raw_text: str, c: dict, fallback_theme: str):
     """
     Gemini javobidan xatosiz post matni va rasm promptini ajratib oladi.
     JSON buzilgan bo'lsa ham matnni 100% saqlab qoladi!
@@ -981,20 +1317,16 @@ def extract_post_from_text(raw_text: str, fallback_theme: str):
     # Agar JSON bo'lmasa, toza matnni post sifatida olish
     clean = re.sub(r"[\{\}\"']", "", txt).strip()
     if len(clean) > 80:
+        adaptive = generate_niche_adaptive_post_and_poll(c, fallback_theme)
         return {
             "post_text": clean,
-            "image_prompt": "professional modern digital workspace with computers glowing screens 8k resolution cinematic lighting",
-            "poll_question": "Ushbu ma'lumot siz uchun foydali bo'ldimi? 💡",
-            "poll_options": ["Juda foydali bo'ldi! 🔥", "Yaxshi ma'lumot 👍", "Boshqa mavzular ham kerak 📝"]
+            "image_prompt": adaptive.get("image_prompt", ""),
+            "poll_question": adaptive.get("poll_question", ""),
+            "poll_options": adaptive.get("poll_options", [])
         }
     
-    # Eng oxirgi zaxira
-    return {
-        "post_text": FALLBACK_POSTS.get(fallback_theme, FALLBACK_POSTS["expert_guide"]),
-        "image_prompt": "modern high tech digital workspace 8k resolution cinematic lighting",
-        "poll_question": "Kanalimizdagi navbatdagi mavzu nima bo'lsin? 🚀",
-        "poll_options": ["Yangi loyihalar va keyslar 💡", "Tekin xosting va dasturlar 🛠", "Amaliy qo'llanmalar 📚"]
-    }
+    # AI javob bermasa -> Kanal mavzusiga 100% mos generator
+    return generate_niche_adaptive_post_and_poll(c, fallback_theme)
 
 
 async def ai_generate_full(c):
@@ -1006,13 +1338,16 @@ async def ai_generate_full(c):
     style = random.choice(IMAGE_STYLES)
     
     theme_instructions = {
-        "real_cases": "Mavzu: REAL KEYS VA MUVAFFAQIYAT! Birov oddiy bot yoki sayt yasab qanday qilib daromadga chiqqani, qanday loyiha qilgani haqida hikoya. Obunachilarni ham yangilik yaratishga chorla: «Sizlar ham o'zingizcha biror g'oya o'ylab ko'ring, yaratib ko'ring!».",
-        "free_tools": "Mavzu: BEPUL INSTRUMENTLAR VA TEKIN XOSTINGLAR! Telegram botlarni tekin qayerga qo'ysa bo'ladi (Render.com, PythonAnywhere, Railway, Vercel, Koyeb), sayt ochish uchun bepul vositalar va platformalar haqida aniq, foydali tavsiyalar.",
-        "youtube_learning": "Mavzu: YOUTUBE VA INTERNETDARSLIKLARI! Xuddi onadek mehribonlik bilan, obunachilar ko'proq narsa o'rganishi uchun YouTube'dagi qidirish kerak bo'lgan eng foydali darslar va bilim manbalarini tavsiya qil.",
-        "interactive_game": "Mavzu: QIZIQARLI O'YIN VA TOPISHMOQ! Auditoriya bilan mantiqiy o'yin, qiziqarli topishmoq yoki fikrlashga undovchi viktorina o'tkaz.",
-        "funny_memes": "Mavzu: KULGILI HAYOTIY MEM VA VOQEA! Shu sohadagi kulgili hayotiy holat, dasturchilar/treyderlar/foydalanuvchilar duch keladigan qiziqarli hazil va kayfiyat ko'taruvchi gaplar.",
+        "real_cases": "Mavzu: REAL KEYS VA MUVAFFAQIYAT! Shu kanal mavzusida birov qanday qilib natijaga/daromadga chiqqani, qanday loyiha qilgani haqida hikoya. Obunachilarni ham yangilik yaratishga chorla: «Sizlar ham o'zingizcha biror g'oya o'ylab ko'ring, yaratib ko'ring!».",
+        "free_tools": "Mavzu: BEPUL INSTRUMENTLAR VA VOSITALAR! Shu soha bo'yicha tekin dasturlar, xostinglar, platformalar va vositalar haqida aniq, foydali tavsiyalar.",
+        "youtube_learning": "Mavzu: YOUTUBE VA INTERNET DARSLIKLARI! Xuddi onadek/ustozdek mehribonlik bilan, obunachilar ko'proq narsa o'rganishi uchun YouTube'dagi qidirish kerak bo'lgan eng foydali darslar va bilim manbalarini tavsiya qil.",
+        "interactive_game": "Mavzu: QIZIQARLI O'YIN VA TOPISHMOQ! Auditoriya bilan shu soha bo'yicha mantiqiy o'yin, qiziqarli topishmoq yoki test o'tkaz.",
+        "funny_memes": "Mavzu: KULGILI HAYOTIY MEM VA VOQEA! Shu sohadagi qiziqarli hayotiy holat, mutaxassislar uchraydigan kulgili voqea va kayfiyat ko'taruvchi gaplar.",
         "expert_guide": "Mavzu: AMALIY EKSPERT MASLAHATI! Foydalanuvchining kanal mavzusi bo'yicha eng zarur, qimmatli va amaliy qo'llanma."
     }
+    
+    encoded_search = urllib.parse.quote(f"{c['niche']} darslari")
+    yt_example = f"https://www.youtube.com/results?search_query={encoded_search}"
     
     prompt = f"""Sen «{c['title']}» kanalining eng iqtidorli, jonkuyar va professional bosh muharririsan.
 Kanal yo'nalishi: {c['niche']}
@@ -1021,24 +1356,24 @@ Auditoriya: {c['audience']}
 AI UCHUN ASOSIY YO'RIQNOMA (PROMPT):
 {c['detailed_prompt'] or "Kanal mavzusiga mos eng foydali va qiziqarli narsalarni yoritish."}
 
-BU POST UCHUN TANLANGAN MAXSUS YO'NALISH:
+BU POST UCHUN TANLANGAN MAVZU:
 👉 {theme_instructions.get(theme)}
-
-Guruhdagi a'zolar yaqinda ko'targan mavzular (inobatga olinsin):
-{insights}
 
 Oxirgi postlar (takrorlanmasin):
 {" | ".join(recent) if recent else "Yo'q"}
 
-Talablar:
-1. O'zbek tilida, nihoyatda samimiy, jozibador, qisqa va lo'nda (cho'zib yubormasdan, 400-800 belgi).
+Guruhdagi muhokamalar:
+{insights}
+
+MUHIM TALABLAR:
+1. O'zbek tilida, nihoyatda samimiy, onadek g'amxo'r, rag'batlantiruvchi va jonli tilda yoz (400-800 belgi).
 2. Diqqatni birinchi soniyada tortadigan kuchli sarlavha (Hook).
 3. Matn shriftlari qalin (<b>...</b>), muhim jumlalar (<i>...</i>), parametr va kodlar (<code>...</code>).
 4. Emojilarga boy va jozibador (🚀, 💡, 🛠, 🎥, 🎮, 😂, 💎, ⚡️).
-5. O'zingni AI deb atama.
-6. image_prompt: Ingliz tilida, ushbu uslubda yoz: "{style}".
-7. poll_question: Auditoriya uchun qiziq savol (maksimal 200 belgi).
-8. poll_options: 3-4 ta takrorlanmas variant.
+5. Post ichiga mavzuga doir YouTube qidiruv/darslik havolasini qo'sh: masalan: <a href="{yt_example}">🎥 YouTube'da ushbu darslikni tomosha qiling</a>
+6. poll_question: Aynan «{c['title']}» kanali mavzusi ({c['niche']}) bo'yicha 1 ta o'ta qiziq so'rovnoma savoli (maksimal 200 belgi).
+7. poll_options: Ushbu savolga mos 3-4 ta takrorlanmas variant.
+8. image_prompt: Ingliz tilida, ushbu uslubda yoz: "{style}".
 
 Javobni FAQAT toza JSON formatida qaytar:
 {{
@@ -1048,21 +1383,22 @@ Javobni FAQAT toza JSON formatida qaytar:
   "poll_options": ["Variant 1", "Variant 2", "Variant 3"]
 }}
 """
-    models_to_try = [GEMINI_MODEL, "gemini-flash-latest", "gemini-3.8-flash", "gemini-3-flash-preview"]
+    client = get_gemini_client()
+    models_to_try = [GEMINI_MODEL, "gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest", "gemini-3.8-flash", "gemini-3-flash-preview"]
     for m in models_to_try:
         try:
-            r = await ai.aio.models.generate_content(model=m, contents=prompt)
+            r = await client.aio.models.generate_content(model=m, contents=prompt)
             raw = (r.text or "").strip()
             if raw:
-                extracted = extract_post_from_text(raw, theme)
+                extracted = extract_post_from_text(raw, c, theme)
                 if extracted and extracted.get("post_text"):
                     return extracted
         except Exception as e:
             logging.warning(f"AI generatsiya urinishi ({m}) muvaffaqiyatsiz: {e}")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
-    # Agar barcha modellar xato bersa -> Zaxira post
-    return extract_post_from_text("", theme)
+    # Agar barcha modellar xato bersa -> Niche-Adaptive generator
+    return generate_niche_adaptive_post_and_poll(c, theme)
 
 
 # ============================ XILMA-XIL RASMLAR YARATISH VA YUKLASH ============================
@@ -1117,7 +1453,8 @@ async def send_ai_post(c, with_image=True):
     data = await ai_generate_full(c)
     post_text = data.get("post_text", "").strip()
     if not post_text:
-        post_text = FALLBACK_POSTS["expert_guide"]
+        adaptive = generate_niche_adaptive_post_and_poll(c)
+        post_text = adaptive["post_text"]
         
     img_prompt = data.get("image_prompt", "")
     sent = False
@@ -1158,32 +1495,17 @@ async def send_ai_post(c, with_image=True):
         q("UPDATE channels SET posts_sent = posts_sent + 1 WHERE channel_id=?", (c["channel_id"],), commit=True)
         q("INSERT INTO recent_posts VALUES (?,?,?)", (c["channel_id"], post_text, now_utc().isoformat()), commit=True)
         auto_backup_channels()
-        return True, "🎉 <b>Post kanalga muvaffaqiyatli yuborildi!</b>"
+        preview = post_text[:350] + ("..." if len(post_text) > 350 else "")
+        return True, (
+            f"🎉 <b>Post «{html.escape(c['title'])}» kanaliga muvaffaqiyatli yuborildi!</b>\n\n"
+            f"📌 <b>Kanal yo'nalishi:</b> {html.escape(c['niche'])}\n\n"
+            f"📝 <b>Post matni:</b>\n{preview}"
+        )
     else:
         return False, f"❌ <b>Xatolik yuz berdi:</b> <code>{error_detail or 'Telegram kanalda bot huquqini tekshiring'}</code>"
 
 
 # ============================ KAFOLATLANGAN INTERAKTIV SO'ROVNOMA (POLL) ============================
-FALLBACK_POLLS = [
-    {
-        "q": "Siz ko'proq qaysi mavzulardagi amaliy darslarni o'rganishni xohlaysiz? 🚀",
-        "opts": ["Telegram botlar va avtomatlashtirish 🤖", "Saytlar va Web-dasturlash 💻", "Internetda loyiha yaratish 📈", "Bepul IT instrumentlar 🛠"]
-    },
-    {
-        "q": "Telegram botingizni bepul xostingga qo'yganmisiz? 🌐",
-        "opts": ["Ha, Render/PythonAnywhere ishlataman ✅", "Yo'q, hali bilmayman 🤔", "Kompyuterimda ishlaydi 💻", "Tekin xosting qo'llanmasi kerak 📝"]
-    },
-    {
-        "q": "Sizningcha, loyiha muvaffaqiyatida eng muhimi nima? 💡",
-        "opts": ["Doimiy amaliyot qilish 🎯", "Mantiqiy fikrlash 🧠", "To'g'ri g'oya tanlash 🚀", "Sabr va intizom ⏳"]
-    },
-    {
-        "q": "Kanalimizda navbatdagi post qanday formatda bo'lishini xohlaysiz? ✨",
-        "opts": ["Batafsil mini-qo'llanma 📚", "Real keys / Muvaffaqiyat tarixi 💡", "YouTube'dan video tavsiya 🎥", "Qiziqarli mantiqiy o'yin 🎮"]
-    }
-]
-
-
 async def send_ai_poll(c):
     question = None
     options = []
@@ -1201,9 +1523,9 @@ async def send_ai_poll(c):
             options = unique_opts[:10]
             
     if not question or len(options) < 2:
-        fb = random.choice(FALLBACK_POLLS)
-        question = fb["q"]
-        options = fb["opts"]
+        adaptive = generate_niche_adaptive_post_and_poll(c)
+        question = adaptive["poll_question"]
+        options = adaptive["poll_options"]
         
     try:
         try:
@@ -1222,7 +1544,15 @@ async def send_ai_poll(c):
             )
         q("UPDATE channels SET polls_sent = polls_sent + 1 WHERE channel_id=?", (c["channel_id"],), commit=True)
         auto_backup_channels()
-        return True, "📊 <b>Interaktiv so'rovnoma kanalga muvaffaqiyatli yuborildi!</b>"
+        
+        opts_formatted = "\n".join(f"{i+1}. {opt}" for i, opt in enumerate(options))
+        success_msg = (
+            f"📊 <b>Interaktiv so'rovnoma «{html.escape(c['title'])}» kanaliga muvaffaqiyatli yuborildi!</b>\n\n"
+            f"📌 <b>Kanal yo'nalishi:</b> {html.escape(c['niche'])}\n\n"
+            f"❓ <b>Savol:</b> {html.escape(question)}\n\n"
+            f"🔘 <b>Variantlar:</b>\n{html.escape(opts_formatted)}"
+        )
+        return True, success_msg
     except Exception as e:
         logging.error(f"Kanalga poll yuborishda xatolik: {e}")
         return False, f"❌ <b>So'rovnoma yuborilmadi:</b> <code>{e}</code>"
@@ -1341,6 +1671,9 @@ async def handle_violation(m: types.Message, chat_id: int, reason_text: str):
     warns, cycle = (r["warnings"], r["cycle"]) if r else (0, 0)
     warns += 1
 
+    # Guruh ogohlantirishlar sonini yangilash
+    q("UPDATE channels SET warnings = warnings + 1 WHERE group_id=?", (chat_id,), commit=True)
+
     if warns < 3:
         q("INSERT OR REPLACE INTO violations VALUES (?,?,?,?)", (chat_id, uid, warns, cycle), commit=True)
         warn_msg = await m.answer(
@@ -1351,6 +1684,8 @@ async def handle_violation(m: types.Message, chat_id: int, reason_text: str):
         asyncio.create_task(delete_later(warn_msg, 20))
         return
 
+    # Guruh cheklovlari va banlar sonini yangilash
+    q("UPDATE channels SET bans = bans + 1 WHERE group_id=?", (chat_id,), commit=True)
     try:
         if cycle == 0:
             q("INSERT OR REPLACE INTO violations VALUES (?,?,?,?)", (chat_id, uid, 0, 1), commit=True)
@@ -1376,6 +1711,9 @@ async def group_handler(m: types.Message):
         
     text_content = m.text.strip()
     chat_id = m.chat.id
+    
+    # Guruhdagi xabarlar statistikasini yangilash
+    q("UPDATE channels SET group_messages = group_messages + 1 WHERE group_id=?", (chat_id,), commit=True)
     
     if await is_admin_of(chat_id, m.from_user.id):
         return
@@ -1411,7 +1749,8 @@ async def group_handler(m: types.Message):
             f"Foydalanuvchi savoli: {clean_query}"
         )
         try:
-            r = await ai.aio.models.generate_content(model=GEMINI_MODEL, contents=ai_prompt)
+            client = get_gemini_client()
+            r = await client.aio.models.generate_content(model=GEMINI_MODEL, contents=ai_prompt)
             ans = (r.text or "").strip()
             if ans:
                 await m.reply(ans)
@@ -1461,15 +1800,19 @@ AdminMsg = F.from_user.id.in_(ADMIN_IDS)
 async def admin_panel(m: types.Message, state: FSMContext):
     await state.clear()
     card_num, card_own = get_card_info()
+    g_key = get_gemini_api_key()
+    masked_g = (g_key[:6] + "..." + g_key[-4:]) if len(g_key) > 10 else (g_key or "Kiritilmagan")
     await m.answer(
         "🛠 <b>BOSH ADMIN BOSHQARUV PANELI</b>\n\n"
-        f"💳 <b>Hozirgi karta:</b> <code>{card_num}</code> ({html.escape(card_own)})\n\n"
+        f"💳 <b>Hozirgi karta:</b> <code>{card_num}</code> ({html.escape(card_own)})\n"
+        f"🔑 <b>Gemini AI Kalit:</b> <code>{masked_g}</code>\n\n"
         "<i>Quyidagi bo'limlardan birini tanlang:</i>",
         reply_markup=ik(
             [("📊 Umumiy Statistika", "adm:stats"), ("💳 Kutilayotgan To'lovlar", "adm:pay")],
-            [("💳 Karta Sozlamalari", "adm:card"), ("👥 Foydalanuvchini boshqarish", "adm:user")],
-            [("📺 Barcha Kanallar", "adm:channels"), ("💾 Baza Zaxirasi (Backup)", "adm:backup")],
-            [("📣 Reklama Yuborish (Broadcast)", "adm:bcast"), ("🔒 Majburiy Kanallar", "adm:req")],
+            [("💳 Karta Sozlamalari", "adm:card"), ("🔑 Gemini AI Kaliti", "adm:gemini")],
+            [("👥 Foydalanuvchini boshqarish", "adm:user"), ("📺 Barcha Kanallar", "adm:channels")],
+            [("💾 Baza Zaxirasi (Backup)", "adm:backup"), ("📣 Reklama Yuborish (Broadcast)", "adm:bcast")],
+            [("🔒 Majburiy Kanallar", "adm:req")],
         )
     )
 
@@ -1522,6 +1865,69 @@ async def adm_savecardowner(m: types.Message, state: FSMContext):
     await m.answer(f"✅ <b>Karta egasi saqlandi:</b> <b>{html.escape(new_owner)}</b>", reply_markup=MENU)
 
 
+# --- GEMINI AI KALITI SOZLAMALARI ---
+@dp.callback_query(AdminMsg, F.data == "adm:gemini")
+async def adm_gemini(cb: types.CallbackQuery):
+    key = get_gemini_api_key()
+    masked = (key[:6] + "..." + key[-4:]) if len(key) > 10 else (key or "Kiritilmagan")
+    await cb.message.answer(
+        "🔑 <b>GEMINI AI KALITI VA SOZLAMALARI:</b>\n\n"
+        f"🗝 <b>Joriy kalit:</b> <code>{masked}</code>\n"
+        f"🤖 <b>Asosiy model:</b> <code>{GEMINI_MODEL}</code>\n\n"
+        "<i>Quyidagi amallardan birini tanlang 👇</i>",
+        reply_markup=ik(
+            [("🧪 Kalitni sinab ko'rish (Test)", "adm:testgemini")],
+            [("✏️ Yangi Gemini kalit kiritish", "adm:setgemini")],
+            [("🔙 Orqaga", "adm:back")]
+        )
+    )
+    await cb.answer()
+
+
+@dp.callback_query(AdminMsg, F.data == "adm:testgemini")
+async def adm_testgemini(cb: types.CallbackQuery):
+    await cb.answer("⏳ Gemini AI tekshirilmoqda...")
+    ok, msg = await test_gemini_key()
+    if ok:
+        await cb.message.answer(f"✅ <b>Gemini AI to'liq ishlamoqda!</b>\n\n{msg}")
+    else:
+        await cb.message.answer(
+            f"❌ <b>Gemini AI ulanmadi!</b>\n\n"
+            f"Sababi: <code>{msg}</code>\n\n"
+            "💡 <i>Eslatma: Haqiqiy bepul Gemini API kalitini https://aistudio.google.com/app/apikey "
+            "saytidan bepul olishingiz mumkin (odatda «AIzaSy...» bilan boshlanadi).</i>"
+        )
+
+
+@dp.callback_query(AdminMsg, F.data == "adm:setgemini")
+async def adm_setgemini(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminGemini.key)
+    await cb.message.answer(
+        "🔑 <b>Yangi Gemini API kalitini yuboring:</b>\n\n"
+        "Uni https://aistudio.google.com/app/apikey manzilidan bepul olishingiz mumkin "
+        "(odatda <code>AIzaSy...</code> bilan boshlanadi).\n\n"
+        "Bekor qilish: /cancel"
+    )
+    await cb.answer()
+
+
+@dp.message(AdminGemini.key, AdminMsg, F.text)
+async def adm_savegemini(m: types.Message, state: FSMContext):
+    new_key = m.text.strip()
+    q("INSERT OR REPLACE INTO settings (key, value) VALUES ('gemini_api_key', ?)", (new_key,), commit=True)
+    await state.clear()
+    
+    ok, msg = await test_gemini_key(new_key)
+    if ok:
+        await m.answer(f"🎉 <b>Yangi Gemini API kaliti saqlandi va tekshirildi!</b>\n\n{msg}", reply_markup=MENU)
+    else:
+        await m.answer(
+            f"⚠️ <b>Kalit saqlandi, lekin Google xato qaytardi:</b>\n<code>{msg}</code>\n\n"
+            "Iltimos, kalit to'g'riligini tekshiring (bepul olish: https://aistudio.google.com/app/apikey).",
+            reply_markup=MENU
+        )
+
+
 # --- BAZA ZAXIRASI (BACKUP / RESTORE) ---
 @dp.callback_query(AdminMsg, F.data == "adm:backup")
 async def adm_backup_menu(cb: types.CallbackQuery):
@@ -1571,15 +1977,19 @@ async def adm_process_restore_file(m: types.Message, state: FSMContext):
 async def adm_back_btn(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
     card_num, card_own = get_card_info()
+    g_key = get_gemini_api_key()
+    masked_g = (g_key[:6] + "..." + g_key[-4:]) if len(g_key) > 10 else (g_key or "Kiritilmagan")
     await cb.message.edit_text(
         "🛠 <b>BOSH ADMIN BOSHQARUV PANELI</b>\n\n"
-        f"💳 <b>Hozirgi karta:</b> <code>{card_num}</code> ({html.escape(card_own)})\n\n"
+        f"💳 <b>Hozirgi karta:</b> <code>{card_num}</code> ({html.escape(card_own)})\n"
+        f"🔑 <b>Gemini AI Kalit:</b> <code>{masked_g}</code>\n\n"
         "<i>Quyidagi bo'limlardan birini tanlang:</i>",
         reply_markup=ik(
             [("📊 Umumiy Statistika", "adm:stats"), ("💳 Kutilayotgan To'lovlar", "adm:pay")],
-            [("💳 Karta Sozlamalari", "adm:card"), ("👥 Foydalanuvchini boshqarish", "adm:user")],
-            [("📺 Barcha Kanallar", "adm:channels"), ("💾 Baza Zaxirasi (Backup)", "adm:backup")],
-            [("📣 Reklama Yuborish (Broadcast)", "adm:bcast"), ("🔒 Majburiy Kanallar", "adm:req")],
+            [("💳 Karta Sozlamalari", "adm:card"), ("🔑 Gemini AI Kaliti", "adm:gemini")],
+            [("👥 Foydalanuvchini boshqarish", "adm:user"), ("📺 Barcha Kanallar", "adm:channels")],
+            [("💾 Baza Zaxirasi (Backup)", "adm:backup"), ("📣 Reklama Yuborish (Broadcast)", "adm:bcast")],
+            [("🔒 Majburiy Kanallar", "adm:req")],
         )
     )
     await cb.answer()
