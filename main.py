@@ -1,16 +1,15 @@
 """
 Kanal boshqaruv boti (aiogram 3 + Gemini + SQLite + Flux AI + Web Photos)
 
-Xususiyatlar:
-- Professional AI tahririyat (Gemini 3 Flash Preview)
-- Har qanday formatdagi kanal havolalarini (https://t.me/..., @..., ID) to'liq qo'llab-quvvatlash
+Yangi imkoniyatlar:
+- 100% kafolatlangan Post va So'rovnoma yuborish (xatolik bo'lsa zaxiraga o'tish)
+- Har qanday formatdagi kanal havolalarini (@..., https://t.me/..., ID) qo'llab-quvvatlash
 - Kengaytirilgan moderatsiya (so'kinish, haqorat, kamsitish, firibgarlik/masheniklikka qarshi)
 - 20 soniyada qoidabuzarlik xabarlarini tozalash
 - Guruh chatidagi har bir a'zoga xushmuomala javob / minnatdorchilik bildirish
 - Rang-barang rasmlar (Flux AI har xil uslublar + Internetdan haqiqiy fotolar)
-- Kafolatlangan interaktiv so'rovnomalar (Telegram Polls)
-- Boy post mavzulari: Real Keyslar, Tekin xostinglar (Render, PythonAnywhere), YouTube darsliklar, kulgili memlar, o'yinlar
-- Qalin shriftlar, chiroyli dizayn va emojilarga boy interfeys
+- Renderda kanallar o'chib ketmasligi uchun avtomatik JSON zaxira va tiklash
+- Admin tomonidan karta raqami va egasini bot ichidan o'zgartirish
 """
 import asyncio
 import html
@@ -45,8 +44,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6I4Sl3rZXMyL5C1J6ANVNLFUbA
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "6125160021")
 ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip()}
-CARD_NUMBER = os.getenv("CARD_NUMBER", "8600 0000 0000 0000")
-CARD_OWNER = os.getenv("CARD_OWNER", "Admin")
+DEFAULT_CARD_NUMBER = os.getenv("CARD_NUMBER", "8600 0000 0000 0000")
+DEFAULT_CARD_OWNER = os.getenv("CARD_OWNER", "Admin")
 TZ = ZoneInfo("Asia/Tashkent")
 
 PLANS = {
@@ -69,7 +68,6 @@ PLANS = {
 PLAN_DAYS = 30
 
 # ============================ KENGAYTIRILGAN MODERATSIYA ============================
-# So'kinishlar, haqoratlar, kamsitishlar
 PROFANITY_WORDS = [
     "ahmoq", "itvachcha", "jalap", "haromi", "iflos", "padariga", "suka", "blyat", "naxuy", "nahuy",
     "dalbayob", "dalbayop", "chmo", "lox", "tupoy", "tentak", "mol", "eshak", "onangni", "onang",
@@ -77,7 +75,6 @@ PROFANITY_WORDS = [
     "eblan", "chort", "maraz", "padar", "qanjiq", "foxisha", "geyporn", "porno"
 ]
 
-# Firibgarlik, masheniklik, spam, piramida so'zlari
 SCAM_PHRASES = [
     "kuniga 500$", "kuniga 100$", "kuniga 1000$", "daromad 100%", "kunlik daromad", "investitsiya qiling",
     "investitsiya qilib", "lichkaga yozing", "lichkaga o'ting", "pul ko'paytirish", "garantiyali daromad",
@@ -131,6 +128,9 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id INTEGER, user_id INTEGER,
         user_name TEXT, text TEXT, created_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY, value TEXT
+    );
     """)
     for col, col_type in [
         ("detailed_prompt", "TEXT DEFAULT ''"),
@@ -142,6 +142,11 @@ def init_db():
             db.commit()
         except Exception:
             pass
+
+    # Baza boshlang'ich sozlamalari
+    db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('card_number', ?)", (DEFAULT_CARD_NUMBER,))
+    db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('card_owner', ?)", (DEFAULT_CARD_OWNER,))
+    db.commit()
 
 init_db()
 
@@ -161,6 +166,14 @@ def fmt(dt):
     return dt.astimezone(TZ).strftime("%d.%m.%Y %H:%M")
 
 
+def get_card_info():
+    r_num = q("SELECT value FROM settings WHERE key='card_number'", one=True)
+    r_owner = q("SELECT value FROM settings WHERE key='card_owner'", one=True)
+    num = r_num["value"] if r_num and r_num["value"] else DEFAULT_CARD_NUMBER
+    owner = r_owner["value"] if r_owner and r_owner["value"] else DEFAULT_CARD_OWNER
+    return num, owner
+
+
 def get_user_plan(uid):
     r = q("SELECT plan, expires_at FROM users WHERE user_id=?", (uid,), one=True)
     if r and r["plan"] and r["expires_at"]:
@@ -176,11 +189,45 @@ def register_user(u: types.User):
       (u.id, u.username, u.full_name, now_utc().isoformat()), commit=True)
 
 
-# ============================ KANAL HAVOLALARINI PARSE QILISH ============================
+# ============================ ZAXIRA NUSXA VA TIKLASH (RENDER DISK XIMOYASI) ============================
+BACKUP_FILE = "channels_backup.json"
+
+def auto_backup_channels():
+    try:
+        rows = q("SELECT * FROM channels")
+        data = [dict(r) for r in rows]
+        with open(BACKUP_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.warning(f"Zaxira fayl yozishda xato: {e}")
+
+
+def auto_restore_channels():
+    if not os.path.exists(BACKUP_FILE):
+        return 0
+    try:
+        with open(BACKUP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        count = 0
+        for r in data:
+            q("""INSERT OR IGNORE INTO channels (channel_id, owner_id, title, niche, audience, group_id, active, posts_sent, join_requests, joined, left_count, group_messages, warnings, bans, detailed_prompt, custom_hours, polls_sent, created_at)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              (r.get("channel_id"), r.get("owner_id"), r.get("title"), r.get("niche"), r.get("audience"),
+               r.get("group_id"), r.get("active", 1), r.get("posts_sent", 0), r.get("join_requests", 0),
+               r.get("joined", 0), r.get("left_count", 0), r.get("group_messages", 0), r.get("warnings", 0),
+               r.get("bans", 0), r.get("detailed_prompt", ""), r.get("custom_hours", ""), r.get("polls_sent", 0),
+               r.get("created_at", now_utc().isoformat())), commit=True)
+            count += 1
+        return count
+    except Exception as e:
+        logging.warning(f"Zaxiradan tiklashda xato: {e}")
+        return 0
+
+auto_restore_channels()
+
+
+# ============================ KANAL HAVOLALARINI TOZALASH ============================
 def clean_channel_input(text: str):
-    """
-    Kanal havolalarini (@username, https://t.me/kanal, t.me/kanal, ID) tozalab qaytaradi.
-    """
     text = text.strip()
     m = re.search(r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/+([a-zA-Z0-9_]+)", text)
     if m:
@@ -242,6 +289,15 @@ class EditHours(StatesGroup):
 
 class EditGroup(StatesGroup):
     group = State()
+
+
+class AdminCard(StatesGroup):
+    number = State()
+    owner = State()
+
+
+class AdminRestore(StatesGroup):
+    file = State()
 
 
 class Pay(StatesGroup):
@@ -336,8 +392,8 @@ async def cmd_start(m: types.Message, state: FSMContext):
         f"👋 <b>Assalomu alaykum, {html.escape(m.from_user.full_name)}!</b>\n\n"
         "🚀 <b>Professional AI Kanal & Guruh Menejeri</b>ga xush kelibsiz!\n\n"
         "⚡️ <b>Imkoniyatlarimiz:</b>\n"
-        "• <b>Turli xil qiziqarli postlar</b> — Real keyslar, bepul xostinglar (Render, PythonAnywhere), "
-        "foydali asboblar, YouTube darsliklari, kulgili memlar va mantiqiy o'yinlar!\n"
+        "• <b>Rang-barang Postlar</b> — Real keyslar, bepul xostinglar (Render, PythonAnywhere), "
+        "foydali vositalar, YouTube darsliklari, kulgili memlar va mantiqiy o'yinlar!\n"
         "• 🖼 <b>Xilma-xil Rasmlar</b> — Flux AI san'at asarlari + Internetdan haqiqiy fotolar!\n"
         "• 📊 <b>Kafolatlangan So'rovnomalar</b> — Auditoriyangizni uyg'otuvchi interaktiv ovoz berishlar.\n"
         "• 🛡 <b>Xushyor Guruh Moderatori</b> — So'kinish, haqorat, kamsitish va firibgarlikni zudlik bilan yo'q qiladi (20 soniyada o'chiradi).\n"
@@ -351,6 +407,7 @@ async def cmd_start(m: types.Message, state: FSMContext):
 async def my_account(m: types.Message, state: FSMContext):
     await state.clear()
     plan, exp = get_user_plan(m.from_user.id)
+    card_num, card_own = get_card_info()
     if plan:
         status = f"🟢 <b>Faol tarif:</b> <code>{PLANS[plan]['name']}</code>\n⏳ <b>Tugash vaqti:</b> <code>{fmt(exp)}</code> gacha"
     else:
@@ -359,6 +416,7 @@ async def my_account(m: types.Message, state: FSMContext):
     await m.answer(
         f"💎 <b>TARIFLAR VA TO'LOV TIZIMI</b>\n\n"
         f"📊 <b>Sizning holatingiz:</b>\n{status}\n\n"
+        f"💳 <b>To'lov kartasi:</b> <code>{card_num}</code> ({html.escape(card_own)})\n\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Mavjud Tariflar:</b>\n\n{plans_text()}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -395,13 +453,14 @@ async def buy(cb: types.CallbackQuery, state: FSMContext):
     p = PLANS.get(key)
     if not p:
         return await cb.answer("Tarif topilmadi")
+    card_num, card_own = get_card_info()
     await state.set_state(Pay.receipt)
     await state.update_data(plan=key)
     await cb.message.answer(
         f"💳 <b>{p['name']}</b> tarifini xarid qilish\n\n"
         f"💵 <b>To'lov summasi:</b> <code>{p['price']:,} so'm</code>\n"
-        f"💳 <b>Karta raqami:</b> <code>{CARD_NUMBER}</code>\n"
-        f"👤 <b>Karta egasi:</b> <b>{html.escape(CARD_OWNER)}</b>\n\n"
+        f"💳 <b>Karta raqami:</b> <code>{card_num}</code>\n"
+        f"👤 <b>Karta egasi:</b> <b>{html.escape(card_own)}</b>\n\n"
         f"📸 To'lovni amalga oshirgach, <b>chek skrinshotini rasm sifatida</b> shu yerga yuboring.\n"
         f"❌ Bekor qilish: /cancel".replace(",", " ")
     )
@@ -629,6 +688,9 @@ async def add_ch_hours(m: types.Message, state: FSMContext):
        d["group_id"], custom_hours, now_utc().isoformat()), commit=True)
     await state.clear()
     
+    # Zaxira nusxani darhol yangilash
+    auto_backup_channels()
+    
     await m.answer(
         f"🎉 <b>Kanal muvaffaqiyatli ulandi!</b>\n\n"
         f"📺 <b>Nomi:</b> <b>{html.escape(d['title'])}</b>\n"
@@ -713,6 +775,7 @@ async def toggle_channel(cb: types.CallbackQuery):
     if not own_channel(cid, cb.from_user.id):
         return await cb.answer()
     q("UPDATE channels SET active = 1 - active WHERE channel_id=?", (cid,), commit=True)
+    auto_backup_channels()
     text, kb = await channel_card(cid, cb.from_user.id)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer("Holat yangilandi!")
@@ -723,6 +786,7 @@ async def delete_channel(cb: types.CallbackQuery):
     cid = int(cb.data.split(":")[1])
     if own_channel(cid, cb.from_user.id):
         q("DELETE FROM channels WHERE channel_id=?", (cid,), commit=True)
+        auto_backup_channels()
         await cb.message.edit_text("🗑 <b>Kanal muvaffaqiyatli olib tashlandi.</b>")
     await cb.answer()
 
@@ -749,6 +813,7 @@ async def edit_prompt_finish(m: types.Message, state: FSMContext):
     d = await state.get_data()
     cid = d["cid"]
     q("UPDATE channels SET detailed_prompt=? WHERE channel_id=?", (m.text.strip(), cid), commit=True)
+    auto_backup_channels()
     await state.clear()
     await m.answer("✅ <b>AI Prompti muvaffaqiyatli yangilandi!</b>", reply_markup=MENU)
 
@@ -784,6 +849,7 @@ async def edit_hours_finish(m: types.Message, state: FSMContext):
             return await m.answer("⚠️ Iltimos, soatlarni to'g'ri kiriting (masalan: <code>9, 14, 21</code>):")
     
     q("UPDATE channels SET custom_hours=? WHERE channel_id=?", (custom_hours, cid), commit=True)
+    auto_backup_channels()
     await state.clear()
     await m.answer(f"✅ <b>Soatlar sozlandi:</b> <code>{custom_hours or 'Standart'}</code>", reply_markup=MENU)
 
@@ -822,11 +888,12 @@ async def edit_grp_finish(m: types.Message, state: FSMContext):
             return await m.answer("❌ Guruh topilmadi yoki bot unda yo'q. Qayta urinib ko'ring yoki /cancel bosing.")
     
     q("UPDATE channels SET group_id=? WHERE channel_id=?", (group_id, cid), commit=True)
+    auto_backup_channels()
     await state.clear()
     await m.answer(f"✅ <b>Guruh muvaffaqiyatli yangilandi:</b> <code>{group_id or 'Olib tashlandi'}</code>", reply_markup=MENU)
 
 
-# ============================ PROFESSIONAL AI GENERATOR (RANG-BARANG MAVZULAR) ============================
+# ============================ PROFESSIONAL AI GENERATOR (100% KAFOLATLI) ============================
 POST_THEMES = [
     "real_cases",       # Kim qanday bot/sayt qilib sotdi, real loyiha tajribalari
     "free_tools",       # Tekin xostinglar (Render, PythonAnywhere, Railway, Vercel), sayt platformalari
@@ -845,6 +912,44 @@ IMAGE_STYLES = [
     "cozy vintage retro tech atmosphere, warm tones, high quality photography"
 ]
 
+FALLBACK_POSTS = {
+    "real_cases": (
+        "<b>🚀 Real Keys: Qanday qilib oddiy Telegram bot yaratib sotildi?</b>\n\n"
+        "Ko'pchilik katta dasturchi bo'lmasdan turib daromadli loyiha qilib bo'lmaydi deb o'ylaydi. "
+        "Lekin yaqinda bir yosh dasturchi oddiy <i>restoran buyurtma boti</i>ni yasab, bir nechta kafelarga "
+        "oylik obuna sifatida taqdim etdi! 💡\n\n"
+        "📌 <b>Asosiy xulosa:</b> Katta narsani kutib o'tirmang! Hatto oddiy, lekin odamlar dardini yengillatadigan "
+        "kichik loyiha ham katta imkoniyatlar eshigini ochadi.\n\n"
+        "⚡️ Sizlar ham o'zingizcha biror g'oya o'ylab ko'ring, yaratib ko'ring! Sizda qanday loyiha g'oyasi bor? 👇"
+    ),
+    "free_tools": (
+        "<b>🛠 Telegram botlarni qayerga TEKIN xostingga qo'yish mumkin?</b>\n\n"
+        "Kompyuteringizni 24/7 yoqib o'tirish shart emas. Botingizni bepul serverlarga joylashtiring:\n\n"
+        "1. <b>Render.com</b> — Background Worker yoki Web Service orqali 24/7 bepul ishlatish mumkin.\n"
+        "2. <b>PythonAnywhere.com</b> — Python botlar va skriptlar uchun eng qulay bepul xosting.\n"
+        "3. <b>Railway.app & Koyeb</b> — Tezkor va zamonaviy konteyner xostinglari.\n\n"
+        "💡 Boshlanishiga ushbu platformalar sizga 100% yetadi. Sinab ko'rganmisiz? 🚀"
+    ),
+    "youtube_learning": (
+        "<b>🎥 Bilim olish vaqti: YouTube'dan nimalarni o'rganish kerak?</b>\n\n"
+        "Aziz do'stlar, xuddi mehribon ustozingizdek sizga samimiy maslahat bermoqchiman: "
+        "Internet — bepul bilimlar xazinasi! Vaqtingizni bekorchi videolarga emas, o'z ustingizda ishlashga sarflang ✨\n\n"
+        "📌 <b>Tavsiya qilinadigan qidiruv mavzulari:</b>\n"
+        "• <code>Telegram bot yaratish noldan aiogram 3</code>\n"
+        "• <code>Python dasturlash asoslari to'liq kurs</code>\n"
+        "• <code>Web-sayt yaratish va internet loyihalar</code>\n\n"
+        "Kuniga atigi 30 daqiqa video ko'rib amaliyot qilsangiz, bir oyda natijangizni tanimay qolasiz! 📈"
+    ),
+    "expert_guide": (
+        "<b>💎 Professional Maslahat: Muvaffaqiyatli kanal va loyiha sirlari</b>\n\n"
+        "Har qanday sohada yuqori natijaga erishishning 3 ta oltin qoidasi:\n\n"
+        "1. <b>Doimiylik (Intizom)</b> — Har kuni kichik qadam tashlash, bir kunda hamma narsani qilishdan afzal.\n"
+        "2. <b>Foyda berish</b> — Auditoriyangizga eng toza va amaliy ma'lumotni ulashing.\n"
+        "3. <b>Xatodan qo'rqmaslik</b> — Har bir xato bu yangi tajriba!\n\n"
+        "Bugun o'z maqsadingiz sari qanday qadam tashladingiz? 🎯"
+    )
+}
+
 
 async def get_recent_chat_insights(channel_id):
     rows = q("SELECT user_name, text FROM chat_insights WHERE channel_id=? ORDER BY id DESC LIMIT 15", (channel_id,))
@@ -853,10 +958,46 @@ async def get_recent_chat_insights(channel_id):
     return "\n".join(f"- {r['user_name'] or 'A`zo'}: {r['text']}" for r in rows)
 
 
+def extract_post_from_text(raw_text: str, fallback_theme: str):
+    """
+    Gemini javobidan xatosiz post matni va rasm promptini ajratib oladi.
+    JSON buzilgan bo'lsa ham matnni 100% saqlab qoladi!
+    """
+    txt = raw_text.strip()
+    if txt.startswith("```"):
+        txt = re.sub(r"^```[a-zA-Z]*\n?", "", txt)
+        txt = re.sub(r"```$", "", txt).strip()
+
+    # JSON qidirish
+    json_match = re.search(r"(\{.*\})", txt, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(1))
+            if isinstance(data, dict) and data.get("post_text"):
+                return data
+        except Exception:
+            pass
+
+    # Agar JSON bo'lmasa, toza matnni post sifatida olish
+    clean = re.sub(r"[\{\}\"']", "", txt).strip()
+    if len(clean) > 80:
+        return {
+            "post_text": clean,
+            "image_prompt": "professional modern digital workspace with computers glowing screens 8k resolution cinematic lighting",
+            "poll_question": "Ushbu ma'lumot siz uchun foydali bo'ldimi? 💡",
+            "poll_options": ["Juda foydali bo'ldi! 🔥", "Yaxshi ma'lumot 👍", "Boshqa mavzular ham kerak 📝"]
+        }
+    
+    # Eng oxirgi zaxira
+    return {
+        "post_text": FALLBACK_POSTS.get(fallback_theme, FALLBACK_POSTS["expert_guide"]),
+        "image_prompt": "modern high tech digital workspace 8k resolution cinematic lighting",
+        "poll_question": "Kanalimizdagi navbatdagi mavzu nima bo'lsin? 🚀",
+        "poll_options": ["Yangi loyihalar va keyslar 💡", "Tekin xosting va dasturlar 🛠", "Amaliy qo'llanmalar 📚"]
+    }
+
+
 async def ai_generate_full(c):
-    """
-    Gemini orqali boy, rang-barang, har xil mavzulardagi postlar va rasm promptini generatsiya qilish.
-    """
     insights = await get_recent_chat_insights(c["channel_id"])
     recent = [r["text"][:150] for r in q(
         "SELECT text FROM recent_posts WHERE channel_id=? ORDER BY created_at DESC LIMIT 5", (c["channel_id"],))]
@@ -911,102 +1052,115 @@ Javobni FAQAT toza JSON formatida qaytar:
     for m in models_to_try:
         try:
             r = await ai.aio.models.generate_content(model=m, contents=prompt)
-            txt = (r.text or "").strip()
-            if txt.startswith("```"):
-                txt = re.sub(r"^```[a-zA-Z]*\n?", "", txt)
-                txt = re.sub(r"```$", "", txt).strip()
-            data = json.loads(txt)
-            if data and data.get("post_text"):
-                return data
+            raw = (r.text or "").strip()
+            if raw:
+                extracted = extract_post_from_text(raw, theme)
+                if extracted and extracted.get("post_text"):
+                    return extracted
         except Exception as e:
             logging.warning(f"AI generatsiya urinishi ({m}) muvaffaqiyatsiz: {e}")
-            await asyncio.sleep(1)
-    return None
+            await asyncio.sleep(0.5)
+
+    # Agar barcha modellar xato bersa -> Zaxira post
+    return extract_post_from_text("", theme)
 
 
 # ============================ XILMA-XIL RASMLAR YARATISH VA YUKLASH ============================
 async def download_post_image(prompt: str, niche: str):
-    """
-    50% Flux AI (har safar yangi seed va uslub) + 50% Internetdan haqiqiy fotolar orqali rasm oladi.
-    Natijada rasmlar hech qachon bir xil bo'lmaydi!
-    """
     mode = random.choice(["flux_ai", "web_photo"])
     
     # 1. Flux AI orqali yaratish
     if mode == "flux_ai":
         try:
             seed = random.randint(1000, 99999999)
-            encoded = urllib.parse.quote(prompt[:350])
+            encoded = urllib.parse.quote(prompt[:300])
             url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&model=flux&seed={seed}&nologo=true"
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=35)) as resp:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                     if resp.status == 200:
                         data = await resp.read()
-                        if len(data) > 10000:
+                        if len(data) > 8000:
                             return data
         except Exception as e:
-            logging.warning(f"Flux AI rasmda xato, internet fotosiga o'tilmoqda: {e}")
-    
-    # 2. Internetdan (Unsplash / Wikimedia / Public high-res) haqiqiy fotosurat
-    keywords = ["technology", "coding", "workspace", "computer", "future", "business", "innovation", "server", "creative"]
-    kw = random.choice(keywords)
+            logging.warning(f"Flux AI rasmda kechikish: {e}")
+
+    # 2. Internetdan yuqori aniqlikdagi haqiqiy fotosurat
     img_urls = [
-        f"https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=1280&q=80",
-        f"https://images.unsplash.com/photo-1498050108023-c5249f4df085?auto=format&fit=crop&w=1280&q=80",
-        f"https://images.unsplash.com/photo-1526374965328-7f61d4dc18c5?auto=format&fit=crop&w=1280&q=80",
-        f"https://images.unsplash.com/photo-1550751827-4bd374c3f58b?auto=format&fit=crop&w=1280&q=80",
-        f"https://images.unsplash.com/photo-1504384308090-c894fdcc538d?auto=format&fit=crop&w=1280&q=80",
-        f"https://images.unsplash.com/photo-1531403009284-440f080d1e12?auto=format&fit=crop&w=1280&q=80",
-        f"https://images.unsplash.com/photo-1551288049-bebda4e38f71?auto=format&fit=crop&w=1280&q=80",
+        "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=1280&q=80",
+        "https://images.unsplash.com/photo-1498050108023-c5249f4df085?auto=format&fit=crop&w=1280&q=80",
+        "https://images.unsplash.com/photo-1526374965328-7f61d4dc18c5?auto=format&fit=crop&w=1280&q=80",
+        "https://images.unsplash.com/photo-1550751827-4bd374c3f58b?auto=format&fit=crop&w=1280&q=80",
+        "https://images.unsplash.com/photo-1504384308090-c894fdcc538d?auto=format&fit=crop&w=1280&q=80",
+        "https://images.unsplash.com/photo-1551288049-bebda4e38f71?auto=format&fit=crop&w=1280&q=80",
         f"https://picsum.photos/1280/720?random={random.randint(1, 9999)}"
     ]
     random.shuffle(img_urls)
-    for u in img_urls:
+    for u in img_urls[:3]:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(u, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                async with session.get(u, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                     if resp.status == 200:
                         data = await resp.read()
-                        if len(data) > 10000:
+                        if len(data) > 8000:
                             return data
         except Exception:
             continue
     return None
 
 
-# ============================ KANALGA POST YUBORISH ============================
+# ============================ KANALGA POST YUBORISH (100% KAFOLATLI) ============================
 async def send_ai_post(c, with_image=True):
+    """
+    Postni 100% kanalga yetkazadi.
+    Qaytaradi: (bool ok, str message)
+    """
     data = await ai_generate_full(c)
-    if not data or not data.get("post_text"):
-        return False
-    
-    post_text = data["post_text"].strip()
+    post_text = data.get("post_text", "").strip()
+    if not post_text:
+        post_text = FALLBACK_POSTS["expert_guide"]
+        
     img_prompt = data.get("image_prompt", "")
-    
     sent = False
+    error_detail = ""
+
+    # Rasm bilan yuborish
     if with_image:
-        img_bytes = await download_post_image(img_prompt or c["niche"], c["niche"])
-        if img_bytes:
-            try:
+        try:
+            img_bytes = await download_post_image(img_prompt or c["niche"], c["niche"])
+            if img_bytes:
                 photo_file = types.BufferedInputFile(img_bytes, filename="post_image.jpg")
-                await bot.send_photo(c["channel_id"], photo=photo_file, caption=post_text)
-                sent = True
-            except Exception as e:
-                logging.error(f"Rasm bilan yuborishda xato, matn yuboriladi: {e}")
-    
+                try:
+                    await bot.send_photo(c["channel_id"], photo=photo_file, caption=post_text)
+                    sent = True
+                except Exception as e_cap:
+                    # Caption 1024 belgidan oshgan bo'lsa yoki HTML xatosi bo'lsa
+                    clean_caption = re.sub(r"<[^>]+>", "", post_text)[:1020]
+                    await bot.send_photo(c["channel_id"], photo=photo_file, caption=clean_caption, parse_mode=None)
+                    sent = True
+        except Exception as e_img:
+            logging.warning(f"Rasm bilan yuborishda xato: {e_img}, matn ko'rinishida yuboriladi...")
+
+    # Agar rasm bilan ketmagan bo'lsa, oddiy matn sifatida yuborish
     if not sent:
         try:
             await bot.send_message(c["channel_id"], post_text)
             sent = True
-        except Exception:
-            clean_text = re.sub(r"<[^>]+>", "", post_text)
-            await bot.send_message(c["channel_id"], clean_text, parse_mode=None)
-            sent = True
-            
+        except Exception as e1:
+            try:
+                clean_text = re.sub(r"<[^>]+>", "", post_text)
+                await bot.send_message(c["channel_id"], clean_text, parse_mode=None)
+                sent = True
+            except Exception as e2:
+                error_detail = str(e2)
+                logging.error(f"Post mutlaqo yuborilmadi ({c['channel_id']}): {e2}")
+
     if sent:
         q("UPDATE channels SET posts_sent = posts_sent + 1 WHERE channel_id=?", (c["channel_id"],), commit=True)
         q("INSERT INTO recent_posts VALUES (?,?,?)", (c["channel_id"], post_text, now_utc().isoformat()), commit=True)
-    return sent
+        auto_backup_channels()
+        return True, "🎉 <b>Post kanalga muvaffaqiyatli yuborildi!</b>"
+    else:
+        return False, f"❌ <b>Xatolik yuz berdi:</b> <code>{error_detail or 'Telegram kanalda bot huquqini tekshiring'}</code>"
 
 
 # ============================ KAFOLATLANGAN INTERAKTIV SO'ROVNOMA (POLL) ============================
@@ -1020,8 +1174,8 @@ FALLBACK_POLLS = [
         "opts": ["Ha, Render/PythonAnywhere ishlataman ✅", "Yo'q, hali bilmayman 🤔", "Kompyuterimda ishlaydi 💻", "Tekin xosting qo'llanmasi kerak 📝"]
     },
     {
-        "q": "Sizningcha, dasturlashda eng muhimi nima? 💡",
-        "opts": ["Doimiy amaliyot qilish 🎯", "Mantiqiy fikrlash 🧠", "To'g'ri loyiha tanlash 🚀", "Sabr va intizom ⏳"]
+        "q": "Sizningcha, loyiha muvaffaqiyatida eng muhimi nima? 💡",
+        "opts": ["Doimiy amaliyot qilish 🎯", "Mantiqiy fikrlash 🧠", "To'g'ri g'oya tanlash 🚀", "Sabr va intizom ⏳"]
     },
     {
         "q": "Kanalimizda navbatdagi post qanday formatda bo'lishini xohlaysiz? ✨",
@@ -1031,18 +1185,13 @@ FALLBACK_POLLS = [
 
 
 async def send_ai_poll(c):
-    """
-    Kanalga interaktiv so'rovnoma (Poll) yuborish. 100% kafolatlangan va xatosiz ishlaydi.
-    """
     question = None
     options = []
     
-    # 1. AI dan so'rovnoma olishga urinish
     data = await ai_generate_full(c)
     if data and data.get("poll_question") and data.get("poll_options"):
         raw_q = str(data["poll_question"]).strip()
         raw_opts = [str(opt).strip() for opt in data["poll_options"] if str(opt).strip()]
-        # Takrorlanmas variantlarni olish
         unique_opts = []
         for o in raw_opts:
             if o not in unique_opts:
@@ -1051,14 +1200,12 @@ async def send_ai_poll(c):
             question = raw_q[:250]
             options = unique_opts[:10]
             
-    # 2. Agar AI xato bersa yoki variantlar kam bo'lsa -> Zaxira so'rovnomalardan olish
     if not question or len(options) < 2:
         fb = random.choice(FALLBACK_POLLS)
         question = fb["q"]
         options = fb["opts"]
         
     try:
-        # Kanalda anonim yoki no-anonim so'rovnoma yuborish
         try:
             await bot.send_poll(
                 chat_id=c["channel_id"],
@@ -1074,10 +1221,11 @@ async def send_ai_poll(c):
                 is_anonymous=True,
             )
         q("UPDATE channels SET polls_sent = polls_sent + 1 WHERE channel_id=?", (c["channel_id"],), commit=True)
-        return True
+        auto_backup_channels()
+        return True, "📊 <b>Interaktiv so'rovnoma kanalga muvaffaqiyatli yuborildi!</b>"
     except Exception as e:
         logging.error(f"Kanalga poll yuborishda xatolik: {e}")
-        return False
+        return False, f"❌ <b>So'rovnoma yuborilmadi:</b> <code>{e}</code>"
 
 
 # ============================ TEZKOR TUGMALAR HANDLERLARI ============================
@@ -1091,12 +1239,9 @@ async def on_click_imgpost(cb: types.CallbackQuery):
     if not plan:
         return await cb.answer("Tarifingiz faol emas!", show_alert=True)
     
-    await cb.answer("⏳ Professional rasm va post tayyorlanmoqda (10-15 soniya)...")
-    ok = await send_ai_post(c, with_image=True)
-    if ok:
-        await cb.message.answer("🎉 <b>Yangi rasm va qiziqarli post kanalga yuborildi!</b>")
-    else:
-        await cb.message.answer("❌ <b>Post yuborib bo'lmadi.</b> Bot kanalda admin ekanligini tekshiring.")
+    await cb.answer("⏳ Professional rasm va post tayyorlanmoqda (bir necha soniya)...")
+    ok, msg = await send_ai_post(c, with_image=True)
+    await cb.message.answer(msg)
 
 
 @dp.callback_query(F.data.startswith("post:"))
@@ -1110,11 +1255,8 @@ async def on_click_post(cb: types.CallbackQuery):
         return await cb.answer("Tarif faol emas!", show_alert=True)
     
     await cb.answer("⏳ Post tayyorlanmoqda...")
-    ok = await send_ai_post(c, with_image=False)
-    if ok:
-        await cb.message.answer("✅ <b>Professional matnli post kanalga yuborildi!</b>")
-    else:
-        await cb.message.answer("❌ Xatolik yuz berdi.")
+    ok, msg = await send_ai_post(c, with_image=False)
+    await cb.message.answer(msg)
 
 
 @dp.callback_query(F.data.startswith("poll:"))
@@ -1128,11 +1270,8 @@ async def on_click_poll(cb: types.CallbackQuery):
         return await cb.answer("Tarif faol emas!", show_alert=True)
     
     await cb.answer("⏳ So'rovnoma tayyorlanmoqda...")
-    ok = await send_ai_poll(c)
-    if ok:
-        await cb.message.answer("📊 <b>Interaktiv so'rovnoma (Poll) kanalga muvaffaqiyatli yuborildi!</b>")
-    else:
-        await cb.message.answer("❌ So'rovnomani yuborib bo'lmadi. Bot kanalda admin ekanini tekshiring.")
+    ok, msg = await send_ai_poll(c)
+    await cb.message.answer(msg)
 
 
 # ============================ AVTO JADVAL VA SCHEDULER ============================
@@ -1182,9 +1321,6 @@ async def expiry_reminders():
 
 # ============================ XUSHYOR GURUH MODERATSIYASI VA SAMIMIY JAVOBLAR ============================
 async def delete_later(msg: types.Message, sec=20):
-    """
-    Xabarni aynan 20 soniyadan so'ng o'chiradi.
-    """
     await asyncio.sleep(sec)
     try:
         await msg.delete()
@@ -1193,13 +1329,9 @@ async def delete_later(msg: types.Message, sec=20):
 
 
 async def handle_violation(m: types.Message, chat_id: int, reason_text: str):
-    """
-    So'kingan yoki firibgarlik qilgan xabarni darhol o'chiradi va 20 soniyada o'chuvchi ogohlantirish beradi.
-    """
     uid = m.from_user.id
     mention = m.from_user.mention_html()
     
-    # 1. Qoidabuzar xabarni DARHOL o'chirish
     try:
         await m.delete()
     except Exception:
@@ -1219,7 +1351,6 @@ async def handle_violation(m: types.Message, chat_id: int, reason_text: str):
         asyncio.create_task(delete_later(warn_msg, 20))
         return
 
-    # 3-ogohlantirishdan keyin jazolash
     try:
         if cycle == 0:
             q("INSERT OR REPLACE INTO violations VALUES (?,?,?,?)", (chat_id, uid, 0, 1), commit=True)
@@ -1246,34 +1377,29 @@ async def group_handler(m: types.Message):
     text_content = m.text.strip()
     chat_id = m.chat.id
     
-    # 1. Adminlarni tekshirmaymiz
     if await is_admin_of(chat_id, m.from_user.id):
         return
 
-    # 2. Xushyor moderatsiya: So'kinish yoki haqorat
+    # So'kinish yoki haqorat
     if PROFANITY_RE.search(text_content):
         return await handle_violation(m, chat_id, "guruhda so'kinish, haqorat va kamsitish taqiqlanadi")
         
-    # 3. Xushyor moderatsiya: Firibgarlik (masheniklik), spam va noqonuniy havolalar
+    # Firibgarlik (masheniklik) va spam
     if SCAM_RE.search(text_content):
         return await handle_violation(m, chat_id, "guruhda firibgarlik, spam va noqonuniy reklamalar qat'iyan man etiladi")
     
-    # 4. Ushbu guruh qaysi kanalga ulanganini aniqlash
     c = q("SELECT * FROM channels WHERE group_id=? AND active=1", (chat_id,), one=True)
     channel_id = c["channel_id"] if c else 0
     
-    # 5. A'zolar fikrini bazaga saqlash (AI keyingi postlarda inobatga olishi uchun)
     if len(text_content) > 5 and not text_content.startswith("/"):
         q("INSERT INTO chat_insights (channel_id, user_id, user_name, text, created_at) VALUES (?,?,?,?,?)",
           (channel_id, m.from_user.id, m.from_user.full_name, text_content[:300], now_utc().isoformat()), commit=True)
     
-    # 6. Kanal chatidagi har bir yozgan odamga samimiy javob qaytarish
     me = await bot.me()
     replied = m.reply_to_message and m.reply_to_message.from_user and m.reply_to_message.from_user.id == me.id
     mentioned = f"@{me.username.lower()}" in text_content.lower()
     
     if replied or mentioned:
-        # Botga bevosita murojaat qilinganda chuqur ekspert javob
         clean_query = re.sub(f"@{me.username}", "", text_content, flags=re.I).strip()
         ai_prompt = (
             f"Sen ushbu guruhning oliy toifali, juda xushmuomala ekspert yordamchisisan.\n"
@@ -1293,15 +1419,12 @@ async def group_handler(m: types.Message):
             logging.error(f"Guruhda AI javob xatosi: {e}")
             await m.reply("Savolingiz uchun katta rahmat! 🤝 Tez orada bu bo'yicha batafsil ma'lumot beramiz ✨")
     else:
-        # Oddiy a'zo fikr yozganda do'stona va xushmuomala reaktsiya bildirish
-        # (Guruhni zeriktirmaslik uchun har bir xabarga samimiy minnatdorchilik yoki qisqa iliq javob)
         gratitude_responses = [
             f"Fikringiz uchun katta rahmat, <b>{html.escape(m.from_user.first_name)}</b>! 🤝 Ushbu mavzuni kanalimizda ham tez orada yoritamiz ✨",
             f"Ajoyib fikr! 💡 Buni albatta inobatga olamiz, rahmat!",
             f"Savol va qiziqishingiz uchun rahmat! 🚀 Kanalimizni kuzatib boring, yangi foydali ma'lumotlar tayyorlanmoqda.",
             f"Fikr almashganingiz uchun minnatdormiz! 🤝 Bilim ulashishda davom etamiz."
         ]
-        # Guruhni spam qilmaslik uchun me'yorida, foydali savol va fikrlarga javob berish
         if any(w in text_content.lower() for w in ["qanday", "qaysi", "nima", "kerak", "maslahat", "yordam", "fikr", "loyiha", "bot", "sayt"]):
             await m.reply(random.choice(gratitude_responses))
 
@@ -1337,15 +1460,129 @@ AdminMsg = F.from_user.id.in_(ADMIN_IDS)
 @dp.message(Command("admin"), F.chat.type == "private", AdminMsg)
 async def admin_panel(m: types.Message, state: FSMContext):
     await state.clear()
+    card_num, card_own = get_card_info()
     await m.answer(
         "🛠 <b>BOSH ADMIN BOSHQARUV PANELI</b>\n\n"
+        f"💳 <b>Hozirgi karta:</b> <code>{card_num}</code> ({html.escape(card_own)})\n\n"
         "<i>Quyidagi bo'limlardan birini tanlang:</i>",
         reply_markup=ik(
             [("📊 Umumiy Statistika", "adm:stats"), ("💳 Kutilayotgan To'lovlar", "adm:pay")],
-            [("👥 Foydalanuvchini boshqarish", "adm:user"), ("📺 Barcha Kanallar", "adm:channels")],
+            [("💳 Karta Sozlamalari", "adm:card"), ("👥 Foydalanuvchini boshqarish", "adm:user")],
+            [("📺 Barcha Kanallar", "adm:channels"), ("💾 Baza Zaxirasi (Backup)", "adm:backup")],
             [("📣 Reklama Yuborish (Broadcast)", "adm:bcast"), ("🔒 Majburiy Kanallar", "adm:req")],
         )
     )
+
+
+# --- KARTA SOZLAMALARI ---
+@dp.callback_query(AdminMsg, F.data == "adm:card")
+async def adm_card(cb: types.CallbackQuery):
+    card_num, card_own = get_card_info()
+    await cb.message.answer(
+        "💳 <b>KARTA SOZLAMALARI:</b>\n\n"
+        f"🔢 <b>Hozirgi karta raqami:</b> <code>{card_num}</code>\n"
+        f"👤 <b>Karta egasi:</b> <b>{html.escape(card_own)}</b>\n\n"
+        "<i>O'zgartirish uchun kerakli tugmani bosing 👇</i>",
+        reply_markup=ik(
+            [("✏️ Karta raqamini o'zgartirish", "adm:setcardnum")],
+            [("✏️ Karta egasini o'zgartirish", "adm:setcardowner")],
+            [("🔙 Orqaga", "adm:back")]
+        )
+    )
+    await cb.answer()
+
+
+@dp.callback_query(AdminMsg, F.data == "adm:setcardnum")
+async def adm_setcardnum(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminCard.number)
+    await cb.message.answer("💳 <b>Yangi karta raqamini yuboring</b> (masalan: <code>8600 1234 5678 9999</code>):")
+    await cb.answer()
+
+
+@dp.message(AdminCard.number, AdminMsg, F.text)
+async def adm_savecardnum(m: types.Message, state: FSMContext):
+    new_num = m.text.strip()
+    q("INSERT OR REPLACE INTO settings (key, value) VALUES ('card_number', ?)", (new_num,), commit=True)
+    await state.clear()
+    await m.answer(f"✅ <b>Karta raqami muvaffaqiyatli saqlandi:</b> <code>{new_num}</code>", reply_markup=MENU)
+
+
+@dp.callback_query(AdminMsg, F.data == "adm:setcardowner")
+async def adm_setcardowner(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminCard.owner)
+    await cb.message.answer("👤 <b>Yangi karta egasining ism-familiyasini yuboring</b> (masalan: <code>Ali Valiyev</code>):")
+    await cb.answer()
+
+
+@dp.message(AdminCard.owner, AdminMsg, F.text)
+async def adm_savecardowner(m: types.Message, state: FSMContext):
+    new_owner = m.text.strip()
+    q("INSERT OR REPLACE INTO settings (key, value) VALUES ('card_owner', ?)", (new_owner,), commit=True)
+    await state.clear()
+    await m.answer(f"✅ <b>Karta egasi saqlandi:</b> <b>{html.escape(new_owner)}</b>", reply_markup=MENU)
+
+
+# --- BAZA ZAXIRASI (BACKUP / RESTORE) ---
+@dp.callback_query(AdminMsg, F.data == "adm:backup")
+async def adm_backup_menu(cb: types.CallbackQuery):
+    count = q("SELECT COUNT(*) c FROM channels", one=True)["c"]
+    await cb.message.answer(
+        "💾 <b>BAZA ZAXIRASI (BACKUP & RESTORE):</b>\n\n"
+        f"Render serveri qayta ishga tushganda kanallar o'chib ketmasligi uchun zaxira nusxasini saqlab qo'yishingiz mumkin.\n"
+        f"📊 <b>Bazadagi joriy kanallar:</b> <b>{count} ta</b>\n\n"
+        "<i>Quyidagi amallardan birini tanlang:</i>",
+        reply_markup=ik(
+            [("📥 Zaxira faylini yuklab olish (Eksport)", "adm:download_backup")],
+            [("📤 Zaxira faylidan tiklash (Import)", "adm:restore_backup")],
+            [("🔙 Orqaga", "adm:back")]
+        )
+    )
+    await cb.answer()
+
+
+@dp.callback_query(AdminMsg, F.data == "adm:download_backup")
+async def adm_download_backup(cb: types.CallbackQuery):
+    auto_backup_channels()
+    if os.path.exists(BACKUP_FILE):
+        doc = types.FSInputFile(BACKUP_FILE, filename=f"channels_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json")
+        await bot.send_document(cb.from_user.id, document=doc, caption="💾 <b>Ulangan barcha kanallarning zaxira nusxasi!</b>")
+    else:
+        await cb.message.answer("⚠️ Hozircha bazada kanallar mavjud emas.")
+    await cb.answer()
+
+
+@dp.callback_query(AdminMsg, F.data == "adm:restore_backup")
+async def adm_restore_backup(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminRestore.file)
+    await cb.message.answer("📤 <b>Iltimos, avval yuklab olingan zaxira (.json) faylini shu yerga yuboring:</b>\n\nBekor qilish: /cancel")
+    await cb.answer()
+
+
+@dp.message(AdminRestore.file, AdminMsg, F.document)
+async def adm_process_restore_file(m: types.Message, state: FSMContext):
+    file_info = await bot.get_file(m.document.file_id)
+    await bot.download_file(file_info.file_path, BACKUP_FILE)
+    restored_count = auto_restore_channels()
+    await state.clear()
+    await m.answer(f"🎉 <b>Baza muvaffaqiyatli tiklandi!</b> Jami <b>{restored_count} ta</b> kanal qayta tiklandi.", reply_markup=MENU)
+
+
+@dp.callback_query(AdminMsg, F.data == "adm:back")
+async def adm_back_btn(cb: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    card_num, card_own = get_card_info()
+    await cb.message.edit_text(
+        "🛠 <b>BOSH ADMIN BOSHQARUV PANELI</b>\n\n"
+        f"💳 <b>Hozirgi karta:</b> <code>{card_num}</code> ({html.escape(card_own)})\n\n"
+        "<i>Quyidagi bo'limlardan birini tanlang:</i>",
+        reply_markup=ik(
+            [("📊 Umumiy Statistika", "adm:stats"), ("💳 Kutilayotgan To'lovlar", "adm:pay")],
+            [("💳 Karta Sozlamalari", "adm:card"), ("👥 Foydalanuvchini boshqarish", "adm:user")],
+            [("📺 Barcha Kanallar", "adm:channels"), ("💾 Baza Zaxirasi (Backup)", "adm:backup")],
+            [("📣 Reklama Yuborish (Broadcast)", "adm:bcast"), ("🔒 Majburiy Kanallar", "adm:req")],
+        )
+    )
+    await cb.answer()
 
 
 @dp.callback_query(AdminMsg, F.data == "adm:stats")
@@ -1545,10 +1782,6 @@ async def bc_cancel(cb: types.CallbackQuery, state: FSMContext):
 
 # ============================ ISHGA TUSHIRISH ============================
 async def run_render_web_server():
-    """
-    Render Web Service port xatosini oldini olish uchun yengil HTTP server.
-    Render $PORT berganida 'Bot is running' deb javob beradi.
-    """
     port_str = os.getenv("PORT")
     if port_str:
         try:
