@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import aiohttp
+from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -1543,7 +1544,33 @@ async def bc_cancel(cb: types.CallbackQuery, state: FSMContext):
 
 
 # ============================ ISHGA TUSHIRISH ============================
+async def run_render_web_server():
+    """
+    Render Web Service port xatosini oldini olish uchun yengil HTTP server.
+    Render $PORT berganida 'Bot is running' deb javob beradi.
+    """
+    port_str = os.getenv("PORT")
+    if port_str:
+        try:
+            port = int(port_str)
+            async def handle_ping(request):
+                return web.Response(text="Bot is running smoothly!")
+
+            app = web.Application()
+            app.router.add_get("/", handle_ping)
+            app.router.add_get("/health", handle_ping)
+            
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", port)
+            await site.start()
+            logging.info(f"Render Health Check server {port}-portda ishga tushdi.")
+        except Exception as e:
+            logging.warning(f"Health server xatosi: {e}")
+
+
 async def main():
+    await run_render_web_server()
     scheduler.add_job(scheduled_tasks, "cron", minute=0)
     scheduler.add_job(expiry_reminders, "cron", hour=10, minute=0)
     scheduler.start()
