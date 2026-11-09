@@ -222,7 +222,13 @@ def get_gemini_client():
 async def test_gemini_key(key: str = None):
     test_k = key.strip() if key else get_gemini_api_key()
     if not test_k:
-        return False, "Kalit bo'sh!"
+        return False, "Kalit kiritilmagan (bo'sh)!"
+    if test_k.startswith("AQ."):
+        return False, (
+            "Kiritilgan kalit formati noto'g'ri (AQ... bilan boshlanadi). "
+            "Google AI Studio API kaliti har doim «AIzaSy...» bilan boshlanadi! "
+            "Uni https://aistudio.google.com/app/apikey manzilidan «Create API key» bosib bepul olishingiz mumkin."
+        )
     try:
         test_client = genai.Client(api_key=test_k, http_options={"api_version": "v1beta"})
         models_to_test = ["gemini-3.8-flash", GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash", "gemini-flash-latest"]
@@ -234,6 +240,11 @@ async def test_gemini_key(key: str = None):
                     return True, f"✅ Aloqa o'rnatildi! ({m} modeli javob berdi)"
             except Exception as e:
                 last_e = str(e)
+        if "UNAUTHENTICATED" in last_e or "ACCESS_TOKEN_TYPE_UNSUPPORTED" in last_e or "API_KEY_INVALID" in last_e:
+            return False, (
+                f"Google xatosi (401 Noto'g'ri kalit): Kalit qabul qilinmadi. "
+                "Iltimos, https://aistudio.google.com/app/apikey manzilidan yangi «AIzaSy...» kalit oling."
+            )
         return False, f"Google xatosi: {last_e or 'Javob olinmadi'}"
     except Exception as e:
         return False, f"Ulanish xatosi: {e}"
@@ -476,6 +487,7 @@ async def check_sub(cb: types.CallbackQuery):
 async def cmd_start(m: types.Message, state: FSMContext):
     await state.clear()
     register_user(m.from_user)
+    admin_hint = "\n\n👑 <b>Siz bot adminisiz!</b> Boshqaruv paneli: /admin" if m.from_user.id in ADMIN_IDS else ""
     await m.answer(
         f"👋 <b>Assalomu alaykum, {html.escape(m.from_user.full_name)}!</b>\n\n"
         "🚀 <b>Professional AI Kanal & Guruh Menejeri</b>ga xush kelibsiz!\n\n"
@@ -485,7 +497,8 @@ async def cmd_start(m: types.Message, state: FSMContext):
         "• 🖼 <b>Xilma-xil Rasmlar</b> — Flux AI san'at asarlari + Internetdan haqiqiy fotolar!\n"
         "• 📊 <b>Kafolatlangan So'rovnomalar</b> — Auditoriyangizni uyg'otuvchi interaktiv ovoz berishlar.\n"
         "• 🛡 <b>Xushyor Guruh Moderatori</b> — So'kinish, haqorat, kamsitish va firibgarlikni zudlik bilan yo'q qiladi (20 soniyada o'chiradi).\n"
-        "• 💬 <b>Samimiy AI Muloqot</b> — Guruhdagi har bir a'zoga xushmuomala javob qaytaradi va ularning fikriga qarab kanalga post chiqaradi!\n\n"
+        "• 💬 <b>Samimiy AI Muloqot</b> — Guruhdagi har bir a'zoga xushmuomala javob qaytaradi va ularning fikriga qarab kanalga post chiqaradi!"
+        f"{admin_hint}\n\n"
         "Pastdagi menyudan boshlang 👇",
         reply_markup=MENU,
     )
@@ -641,18 +654,20 @@ async def is_admin_of(chat_id, user_id):
 @dp.message(F.chat.type == "private", F.text == "➕ Kanal ulash")
 async def add_channel(m: types.Message, state: FSMContext):
     await state.clear()
+    is_adm = m.from_user.id in ADMIN_IDS
     plan, _ = get_user_plan(m.from_user.id)
-    if not plan:
+    if not plan and not is_adm:
         return await m.answer(
             "⚠️ <b>Kanal ulash uchun avval tarif xarid qilishingiz kerak!</b>\n\n"
             f"{plans_text()}", reply_markup=plans_keyboard()
         )
-    n = q("SELECT COUNT(*) c FROM channels WHERE owner_id=?", (m.from_user.id,), one=True)["c"]
-    if n >= PLANS[plan]["channels"]:
-        return await m.answer(
-            f"⚠️ Sizning <b>{PLANS[plan]['name']}</b> tarifingizda ko'pi bilan <b>{PLANS[plan]['channels']} ta</b> kanal ulash mumkin.\n"
-            f"Ko'proq kanal ulash uchun yuqoriroq tarifga o'ting."
-        )
+    if not is_adm:
+        n = q("SELECT COUNT(*) c FROM channels WHERE owner_id=?", (m.from_user.id,), one=True)["c"]
+        if n >= PLANS[plan]["channels"]:
+            return await m.answer(
+                f"⚠️ Sizning <b>{PLANS[plan]['name']}</b> tarifingizda ko'pi bilan <b>{PLANS[plan]['channels']} ta</b> kanal ulash mumkin.\n"
+                f"Ko'proq kanal ulash uchun yuqoriroq tarifga o'ting."
+            )
     await state.set_state(AddCh.channel)
     await m.answer(
         "1️⃣ <b>Kanalni tayyorlash:</b>\n\n"
@@ -688,10 +703,12 @@ async def add_ch_channel(m: types.Message, state: FSMContext):
         return await m.answer("❌ Bot bu kanalda topilmadi. Avval botni kanalingizga admin qiling.")
     if me.status != "administrator" or not getattr(me, "can_post_messages", True):
         return await m.answer("❌ Bot kanalda post yuborish huquqiga ega admin emas. Huquqlarini to'liq bering.")
-    if not await is_admin_of(chat.id, m.from_user.id):
+    is_adm = m.from_user.id in ADMIN_IDS
+    if not await is_admin_of(chat.id, m.from_user.id) and not is_adm:
         return await m.answer("❌ Siz bu kanalning admini emassiz.")
-    if q("SELECT 1 FROM channels WHERE channel_id=?", (chat.id,), one=True):
-        return await m.answer("❌ Bu kanal allaqachon tizimga ulangan.")
+    existing = q("SELECT owner_id FROM channels WHERE channel_id=?", (chat.id,), one=True)
+    if existing and existing["owner_id"] != m.from_user.id and not is_adm:
+        return await m.answer("❌ Bu kanal boshqa foydalanuvchi tomonidan tizimga ulangan.")
     
     await state.update_data(channel_id=chat.id, title=chat.title)
     await state.set_state(AddCh.niche)
@@ -780,7 +797,11 @@ async def add_ch_hours(m: types.Message, state: FSMContext):
     
     d = await state.get_data()
     q("""INSERT INTO channels (channel_id, owner_id, title, niche, detailed_prompt, audience, group_id, custom_hours, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?)""",
+         VALUES (?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(channel_id) DO UPDATE SET
+            owner_id=excluded.owner_id, title=excluded.title, niche=excluded.niche,
+            detailed_prompt=excluded.detailed_prompt, audience=excluded.audience,
+            group_id=excluded.group_id, custom_hours=excluded.custom_hours""",
       (d["channel_id"], m.from_user.id, d["title"], d["niche"], d["detailed_prompt"], d["audience"],
        d["group_id"], custom_hours, now_utc().isoformat()), commit=True)
     await state.clear()
@@ -801,13 +822,20 @@ async def add_ch_hours(m: types.Message, state: FSMContext):
 
 # ============================ KANALLARIM BO'LIMI ============================
 def own_channel(cid, uid):
-    return q("SELECT * FROM channels WHERE channel_id=? AND owner_id=?", (cid, uid), one=True)
+    if uid in ADMIN_IDS:
+        row = q("SELECT * FROM channels WHERE channel_id=?", (cid,), one=True)
+    else:
+        row = q("SELECT * FROM channels WHERE channel_id=? AND owner_id=?", (cid, uid), one=True)
+    return dict(row) if row else None
 
 
 @dp.message(F.chat.type == "private", F.text == "📺 Kanallarim")
 async def my_channels(m: types.Message, state: FSMContext):
     await state.clear()
-    rows = q("SELECT channel_id, title, active FROM channels WHERE owner_id=?", (m.from_user.id,))
+    if m.from_user.id in ADMIN_IDS:
+        rows = q("SELECT channel_id, title, active FROM channels")
+    else:
+        rows = q("SELECT channel_id, title, active FROM channels WHERE owner_id=?", (m.from_user.id,))
     if not rows:
         return await m.answer("📺 Hali hech qanday kanal ulanmagan. «➕ Kanal ulash» tugmasini bosing.")
     await m.answer(
@@ -826,6 +854,8 @@ async def channel_card(cid, uid):
     except Exception:
         subs = "Aniqlanmadi"
     plan, exp = get_user_plan(uid)
+    if uid in ADMIN_IDS and not plan:
+        plan = "max"
     hours_display = c["custom_hours"] if c["custom_hours"] else (", ".join(map(str, PLANS[plan]["hours"])) if plan else "Yo'q")
     prompt_snippet = (c["detailed_prompt"][:120] + "...") if c["detailed_prompt"] and len(c["detailed_prompt"]) > 120 else (c["detailed_prompt"] or "Kiritilmagan")
     
@@ -1018,6 +1048,7 @@ def generate_niche_adaptive_post_and_poll(c, theme=None):
     YouTube darslik havolasi va maxsus so'rovnomaga ega professional generator.
     AI kalit ishlamagan taqdirda ham kanallar bir-birini hech qachon takrorlamaydi!
     """
+    c = dict(c) if c else {}
     title = (c.get("title") or "Kanalimiz").strip()
     niche = (c.get("niche") or "Foydali bilimlar va amaliyot").strip()
     detailed = (c.get("detailed_prompt") or "").strip()
@@ -1360,6 +1391,7 @@ def extract_post_from_text(raw_text: str, c: dict, fallback_theme: str):
 
 
 async def ai_generate_full(c):
+    c = dict(c) if c else {}
     cid = c.get("channel_id", 0)
     insights = await get_recent_chat_insights(cid) if cid else []
     recent = [r["text"][:150] for r in q(
@@ -1481,8 +1513,18 @@ async def send_ai_post(c, with_image=True):
     Postni 100% kanalga yetkazadi.
     Qaytaradi: (bool ok, str message)
     """
-    data = await ai_generate_full(c)
-    post_text = data.get("post_text", "").strip()
+    c = dict(c) if c else {}
+    cid = c.get("channel_id")
+    if not cid:
+        return False, "❌ Kanal ma'lumotlari topilmadi!"
+
+    try:
+        data = await ai_generate_full(c)
+    except Exception as e_gen:
+        logging.warning(f"ai_generate_full xatosi: {e_gen}, niche-adaptive generatorga o'tiladi")
+        data = generate_niche_adaptive_post_and_poll(c)
+
+    post_text = (data.get("post_text") or "").strip()
     if not post_text:
         adaptive = generate_niche_adaptive_post_and_poll(c)
         post_text = adaptive["post_text"]
@@ -1494,43 +1536,46 @@ async def send_ai_post(c, with_image=True):
     # Rasm bilan yuborish
     if with_image:
         try:
-            img_bytes = await download_post_image(img_prompt or c["niche"], c["niche"])
+            img_bytes = await download_post_image(img_prompt or c.get("niche", ""), c.get("niche", ""))
             if img_bytes:
                 photo_file = types.BufferedInputFile(img_bytes, filename="post_image.jpg")
                 try:
-                    await bot.send_photo(c["channel_id"], photo=photo_file, caption=post_text)
+                    await bot.send_photo(cid, photo=photo_file, caption=post_text)
                     sent = True
                 except Exception as e_cap:
                     # Caption 1024 belgidan oshgan bo'lsa yoki HTML xatosi bo'lsa
                     clean_caption = re.sub(r"<[^>]+>", "", post_text)[:1020]
                     photo_file_retry = types.BufferedInputFile(img_bytes, filename="post_image.jpg")
-                    await bot.send_photo(c["channel_id"], photo=photo_file_retry, caption=clean_caption, parse_mode=None)
-                    sent = True
+                    try:
+                        await bot.send_photo(cid, photo=photo_file_retry, caption=clean_caption, parse_mode=None)
+                        sent = True
+                    except Exception as e_ph:
+                        logging.warning(f"Rasm qayta yuborishda xato: {e_ph}")
         except Exception as e_img:
             logging.warning(f"Rasm bilan yuborishda xato: {e_img}, matn ko'rinishida yuboriladi...")
 
     # Agar rasm bilan ketmagan bo'lsa, oddiy matn sifatida yuborish
     if not sent:
         try:
-            await bot.send_message(c["channel_id"], post_text)
+            await bot.send_message(cid, post_text[:4090])
             sent = True
         except Exception as e1:
             try:
-                clean_text = re.sub(r"<[^>]+>", "", post_text)
-                await bot.send_message(c["channel_id"], clean_text, parse_mode=None)
+                clean_text = re.sub(r"<[^>]+>", "", post_text)[:4090]
+                await bot.send_message(cid, clean_text, parse_mode=None)
                 sent = True
             except Exception as e2:
                 error_detail = str(e2)
-                logging.error(f"Post mutlaqo yuborilmadi ({c['channel_id']}): {e2}")
+                logging.error(f"Post mutlaqo yuborilmadi ({cid}): {e2}")
 
     if sent:
-        q("UPDATE channels SET posts_sent = posts_sent + 1 WHERE channel_id=?", (c["channel_id"],), commit=True)
-        q("INSERT INTO recent_posts VALUES (?,?,?)", (c["channel_id"], post_text, now_utc().isoformat()), commit=True)
+        q("UPDATE channels SET posts_sent = posts_sent + 1 WHERE channel_id=?", (cid,), commit=True)
+        q("INSERT INTO recent_posts VALUES (?,?,?)", (cid, post_text, now_utc().isoformat()), commit=True)
         auto_backup_channels()
         preview = post_text[:350] + ("..." if len(post_text) > 350 else "")
         return True, (
-            f"🎉 <b>Post «{html.escape(c['title'])}» kanaliga muvaffaqiyatli yuborildi!</b>\n\n"
-            f"📌 <b>Kanal yo'nalishi:</b> {html.escape(c['niche'])}\n\n"
+            f"🎉 <b>Post «{html.escape(c.get('title', 'Kanal'))}» kanaliga muvaffaqiyatli yuborildi!</b>\n\n"
+            f"📌 <b>Kanal yo'nalishi:</b> {html.escape(c.get('niche', ''))}\n\n"
             f"📝 <b>Post matni:</b>\n{preview}"
         )
     else:
@@ -1539,10 +1584,20 @@ async def send_ai_post(c, with_image=True):
 
 # ============================ KAFOLATLANGAN INTERAKTIV SO'ROVNOMA (POLL) ============================
 async def send_ai_poll(c):
+    c = dict(c) if c else {}
+    cid = c.get("channel_id")
+    if not cid:
+        return False, "❌ Kanal ma'lumotlari topilmadi!"
+
     question = None
     options = []
     
-    data = await ai_generate_full(c)
+    try:
+        data = await ai_generate_full(c)
+    except Exception as e_gen:
+        logging.warning(f"Poll uchun ai_generate_full xatosi: {e_gen}")
+        data = None
+
     if data and data.get("poll_question") and data.get("poll_options"):
         raw_q = str(data["poll_question"]).strip()
         raw_opts = [str(opt).strip() for opt in data["poll_options"] if str(opt).strip()]
@@ -1562,25 +1617,25 @@ async def send_ai_poll(c):
     try:
         try:
             await bot.send_poll(
-                chat_id=c["channel_id"],
+                chat_id=cid,
                 question=question,
                 options=options,
                 is_anonymous=False,
             )
         except Exception:
             await bot.send_poll(
-                chat_id=c["channel_id"],
+                chat_id=cid,
                 question=question,
                 options=options,
                 is_anonymous=True,
             )
-        q("UPDATE channels SET polls_sent = polls_sent + 1 WHERE channel_id=?", (c["channel_id"],), commit=True)
+        q("UPDATE channels SET polls_sent = polls_sent + 1 WHERE channel_id=?", (cid,), commit=True)
         auto_backup_channels()
         
         opts_formatted = "\n".join(f"{i+1}. {opt}" for i, opt in enumerate(options))
         success_msg = (
-            f"📊 <b>Interaktiv so'rovnoma «{html.escape(c['title'])}» kanaliga muvaffaqiyatli yuborildi!</b>\n\n"
-            f"📌 <b>Kanal yo'nalishi:</b> {html.escape(c['niche'])}\n\n"
+            f"📊 <b>Interaktiv so'rovnoma «{html.escape(c.get('title', 'Kanal'))}» kanaliga muvaffaqiyatli yuborildi!</b>\n\n"
+            f"📌 <b>Kanal yo'nalishi:</b> {html.escape(c.get('niche', ''))}\n\n"
             f"❓ <b>Savol:</b> {html.escape(question)}\n\n"
             f"🔘 <b>Variantlar:</b>\n{html.escape(opts_formatted)}"
         )
@@ -1596,9 +1651,9 @@ async def on_click_imgpost(cb: types.CallbackQuery):
     cid = int(cb.data.split(":")[1])
     c = own_channel(cid, cb.from_user.id)
     if not c:
-        return await cb.answer("Kanal topilmadi")
+        return await cb.answer("Kanal topilmadi", show_alert=True)
     plan, _ = get_user_plan(cb.from_user.id)
-    if not plan:
+    if not plan and cb.from_user.id not in ADMIN_IDS:
         return await cb.answer("Tarifingiz faol emas!", show_alert=True)
     
     await cb.answer("⏳ Professional rasm va post tayyorlanmoqda (bir necha soniya)...")
@@ -1611,9 +1666,9 @@ async def on_click_post(cb: types.CallbackQuery):
     cid = int(cb.data.split(":")[1])
     c = own_channel(cid, cb.from_user.id)
     if not c:
-        return await cb.answer("Kanal topilmadi")
+        return await cb.answer("Kanal topilmadi", show_alert=True)
     plan, _ = get_user_plan(cb.from_user.id)
-    if not plan:
+    if not plan and cb.from_user.id not in ADMIN_IDS:
         return await cb.answer("Tarif faol emas!", show_alert=True)
     
     await cb.answer("⏳ Post tayyorlanmoqda...")
@@ -1626,9 +1681,9 @@ async def on_click_poll(cb: types.CallbackQuery):
     cid = int(cb.data.split(":")[1])
     c = own_channel(cid, cb.from_user.id)
     if not c:
-        return await cb.answer("Kanal topilmadi")
+        return await cb.answer("Kanal topilmadi", show_alert=True)
     plan, _ = get_user_plan(cb.from_user.id)
-    if not plan:
+    if not plan and cb.from_user.id not in ADMIN_IDS:
         return await cb.answer("Tarif faol emas!", show_alert=True)
     
     await cb.answer("⏳ So'rovnoma tayyorlanmoqda...")
@@ -1638,6 +1693,7 @@ async def on_click_poll(cb: types.CallbackQuery):
 
 # ============================ AVTO JADVAL VA SCHEDULER ============================
 async def delayed_action(c, action_type):
+    c = dict(c) if c else {}
     try:
         await asyncio.sleep(random.randint(10, 300))
         if action_type == "poll":
@@ -1666,7 +1722,7 @@ async def scheduled_tasks():
             
         if current_hour in allowed_hours:
             action = "poll" if random.random() < 0.3 else "post"
-            asyncio.create_task(delayed_action(c, action))
+            asyncio.create_task(delayed_action(dict(c), action))
 
 
 async def expiry_reminders():
@@ -2076,10 +2132,17 @@ async def adm_pay(cb: types.CallbackQuery):
 @dp.callback_query(AdminMsg, F.data == "adm:channels")
 async def adm_channels(cb: types.CallbackQuery):
     rows = q("SELECT * FROM channels ORDER BY posts_sent DESC LIMIT 25")
-    text = "📺 <b>Barcha Ulangan Kanallar:</b>\n\n" + ("\n".join(
-        f"{'🟢' if r['active'] else '⏸'} <b>{html.escape(r['title'])}</b> | Egasi: <code>{r['owner_id']}</code> | Guruh: <code>{r['group_id'] or 'Yoq'}</code> | Post: {r['posts_sent']} | So'rov: {r['polls_sent']}"
-        for r in rows) or "Kanal mavjud emas.")
-    await cb.message.answer(text)
+    if not rows:
+        await cb.message.answer("📺 <b>Baza bo'sh:</b> Hozircha hech qanday kanal ulanmagan.")
+        return await cb.answer()
+    text = "📺 <b>Barcha Ulangan Kanallar:</b>\n\n" + "\n".join(
+        f"{'🟢' if r['active'] else '⏸'} <b>{html.escape(r['title'])}</b> (ID: <code>{r['channel_id']}</code>)\n"
+        f"Egasi: <code>{r['owner_id']}</code> | Guruh: <code>{r['group_id'] or 'Yo`q'}</code> | Post: {r['posts_sent']} | So'rov: {r['polls_sent']}\n"
+        for r in rows
+    )
+    btns = [[(("🟢 " if r["active"] else "⏸ ") + r["title"], f"ch:{r['channel_id']}")] for r in rows]
+    btns.append([("🔙 Orqaga", "adm:back")])
+    await cb.message.answer(text, reply_markup=ik(*btns))
     await cb.answer()
 
 
