@@ -520,6 +520,9 @@ if __name__ == "__main__":
 async def handle_ping(request):
     return web.Response(text="Bot ishlayapti!")
 
+async def handle_ping(request):
+    return web.Response(text="Bot ishlayapti!")
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
@@ -534,7 +537,7 @@ async def start_web_server():
 # ============================ ASOSIY ISHGA TUSHIRISH ============================
 async def main():
     scheduler.start()
-    await start_web_server()  # Render portini ochadi va Timed Out xatosini yo'qotadi
+    await start_web_server()
     logging.info("Bot muvaffaqiyatli ishga tushdi...")
     await dp.start_polling(bot, allowed_updates=["message", "callback_query", "chat_join_request"])
 
