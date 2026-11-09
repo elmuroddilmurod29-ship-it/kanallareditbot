@@ -505,21 +505,7 @@ async def profile(m: types.Message, state: FSMContext):
         f"💎 <b>Joriy tarif:</b> <b>{plan_name}</b>\n"
     )
 
-
-# ============================ SERVERNI ISHGA TUSHIRISH ============================
-async def main():
-    scheduler.start()
-    logging.info("Bot muvaffaqiyatli ishga tushdi...")
-    # allowed_updates ichiga chat_join_request qo'shildi
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query", "chat_join_request"])
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 # ============================ RENDER UCHUN DUMMY WEB SERVER ============================
-async def handle_ping(request):
-    return web.Response(text="Bot ishlayapti!")
-
 async def handle_ping(request):
     return web.Response(text="Bot ishlayapti!")
 
