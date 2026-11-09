@@ -40,8 +40,8 @@ load_dotenv()
 
 # ============================ SOZLAMALAR ============================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9210617689:AAEPnowEia2VT_wv3Nq8826oJFjFRkjbGl0")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6I4Sl3rZXMyL5C1J6ANVNLFUbANDfJTRhno8pFKT0huEA")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6KAlZvxYEqIFZe1BSp9ADituTrdwe5HuaiFCel53p2oUw")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "6125160021")
 ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip()}
 DEFAULT_CARD_NUMBER = os.getenv("CARD_NUMBER", "8600 0000 0000 0000")
@@ -225,7 +225,7 @@ async def test_gemini_key(key: str = None):
         return False, "Kalit bo'sh!"
     try:
         test_client = genai.Client(api_key=test_k, http_options={"api_version": "v1beta"})
-        models_to_test = [GEMINI_MODEL, "gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest", "gemini-3-flash-preview"]
+        models_to_test = ["gemini-3.8-flash", GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash", "gemini-flash-latest"]
         last_e = ""
         for m in models_to_test:
             try:
@@ -1330,9 +1330,10 @@ def extract_post_from_text(raw_text: str, c: dict, fallback_theme: str):
 
 
 async def ai_generate_full(c):
-    insights = await get_recent_chat_insights(c["channel_id"])
+    cid = c.get("channel_id", 0)
+    insights = await get_recent_chat_insights(cid) if cid else []
     recent = [r["text"][:150] for r in q(
-        "SELECT text FROM recent_posts WHERE channel_id=? ORDER BY created_at DESC LIMIT 5", (c["channel_id"],))]
+        "SELECT text FROM recent_posts WHERE channel_id=? ORDER BY created_at DESC LIMIT 5", (cid,))] if cid else []
     
     theme = random.choice(POST_THEMES)
     style = random.choice(IMAGE_STYLES)
@@ -1384,7 +1385,7 @@ Javobni FAQAT toza JSON formatida qaytar:
 }}
 """
     client = get_gemini_client()
-    models_to_try = [GEMINI_MODEL, "gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest", "gemini-3.8-flash", "gemini-3-flash-preview"]
+    models_to_try = ["gemini-3.8-flash", GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash", "gemini-flash-latest"]
     for m in models_to_try:
         try:
             r = await client.aio.models.generate_content(model=m, contents=prompt)
@@ -1750,10 +1751,19 @@ async def group_handler(m: types.Message):
         )
         try:
             client = get_gemini_client()
-            r = await client.aio.models.generate_content(model=GEMINI_MODEL, contents=ai_prompt)
-            ans = (r.text or "").strip()
+            ans = ""
+            for m_try in ["gemini-3.8-flash", GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash"]:
+                try:
+                    r = await client.aio.models.generate_content(model=m_try, contents=ai_prompt)
+                    ans = (r.text or "").strip()
+                    if ans:
+                        break
+                except Exception:
+                    continue
             if ans:
                 await m.reply(ans)
+            else:
+                await m.reply("Savolingiz uchun katta rahmat! 🤝 Tez orada bu bo'yicha batafsil ma'lumot beramiz ✨")
         except Exception as e:
             logging.error(f"Guruhda AI javob xatosi: {e}")
             await m.reply("Savolingiz uchun katta rahmat! 🤝 Tez orada bu bo'yicha batafsil ma'lumot beramiz ✨")
