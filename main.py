@@ -1,4 +1,4 @@
-"""
+bu"""
 Kanal boshqaruv boti (aiogram 3 + Gemini + SQLite + Flux AI + Web Photos)
 
 Yangi imkoniyatlar:
@@ -513,6 +513,30 @@ async def main():
     # allowed_updates ichiga chat_join_request qo'shildi
     await dp.start_polling(bot, allowed_updates=["message", "callback_query", "chat_join_request"])
 
+
+if __name__ == "__main__":
+    asyncio.run(main())
+# ============================ RENDER UCHUN DUMMY WEB SERVER ============================
+async def handle_ping(request):
+    return web.Response(text="Bot ishlayapti!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/ping", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Veb-server {port}-portda ishga tushdi.")
+
+# ============================ ASOSIY ISHGA TUSHIRISH ============================
+async def main():
+    scheduler.start()
+    await start_web_server()  # Render portini ochadi va Timed Out xatosini yo'qotadi
+    logging.info("Bot muvaffaqiyatli ishga tushdi...")
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query", "chat_join_request"])
 
 if __name__ == "__main__":
     asyncio.run(main())
