@@ -12,6 +12,7 @@ Yangi imkoniyatlar:
 - Admin tomonidan karta raqami va egasini bot ichidan o'zgartirish
 """
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -139,10 +140,10 @@ ROOT_PROFANITIES = [
     r"(?:pashol\s*|di\s*|poshol\s*)?na[hx]u[yj]\w*",
     r"dalba(?:yo|ye|e|o)[bp]\w*",
     r"sik[a-z0-9']*\w*",
-    r"q[o']?toq\w*",
+    r"[qk][o'u]?t[o']?[qk]\w*",
     r"gandon\w*",
-    r"jalap\w*",
-    r"chort\w*",
+    r"(?:z?h|j)ala[bp]\w*",
+    r"ch[ou]rt\w*",
     r"[ye]iban\w*",
     r"eblan\w*",
     r"bl[ya]+[td]?\w*",
@@ -155,11 +156,14 @@ ROOT_PROFANITIES = [
     r"pizd[ae]\w*",
     r"shilta\w*",
     r"qanjiq\w*",
+    r"xuy\w*",
+    r"zaeb\w*",
+    r"poxuy\w*"
 ]
 
 STANDALONE_PROFANITIES = [
     r"ahmoq\w*", r"itvachcha\w*", r"padariga\w*", r"chmo\w*", r"lox\w*",
-    r"tupoy\w*", r"tentak\w*", r"mol\b", r"eshak\w*", r"maraz\w*"
+    r"tupoy\w*", r"tentak\w*", r"mol\b", r"eshak\w*", r"maraz\w*", r"jinni\w*"
 ]
 
 PROFANITY_RE = re.compile(
@@ -174,10 +178,37 @@ SCAM_PATTERNS = [
     r"vznos", r"kripto(?:valyuta)?\s*ko'paytir", r"pul\s*tikib", r"tez\s*boyish",
     r"sxema\s*bor", r"tekinga\s*\d+\$?", r"tekin\s*pul", r"oson\s*pul",
     r"adminman\s*pul", r"parolingizni", r"1xbet", r"stavka", r"linebet",
-    r"melbet", r"mostbet", r"kazinolar", r"kripto\s*piramida",
-    r"shuncha\s*pul\s*ishladim", r"sarmoyasiz\s*daromad"
+    r"melbet", r"mostbet", r"kazinolar?", r"kripto\s*piramida",
+    r"shuncha\s*pul\s*ishladim", r"sarmoyasiz\s*daromad",
+    r"1win", r"aviator", r"lucky\s*jet", r"bukmeker", r"ruletka",
+    r"t\.me/\+", r"t\.me/joinchat/", r"t\.me/[a-zA-Z0-9_]+bot\?start=",
+    r"bit\.ly/", r"clck\.ru/", r"tinyurl\.com/", r"pul\s*ishlash", r"sarmoya",
+    r"kripto\s*bot"
 ]
 SCAM_RE = re.compile(r"(" + "|".join(SCAM_PATTERNS) + r")", re.I)
+
+
+def normalize_text_for_moderation(text: str) -> str:
+    """
+    Keltirilgan matnni leetspeak, kirill-lotin transliteratsiyasi va
+    harflar orasidagi bo'shliqlar hamda belgilardan tozalaydi.
+    """
+    if not text:
+        return ""
+    t = text.lower()
+    trans_map = {
+        '@': 'a', '$': 's', '0': 'o', '1': 'i', '!': 'i', '|': 'i', '3': 'e',
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo',
+        'ж': 'j', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+        'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+        'ф': 'f', 'х': 'x', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sh',
+        'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+        'ў': 'o', 'қ': 'q', 'ғ': 'g', 'ҳ': 'h'
+    }
+    cleaned = [trans_map.get(ch, ch) for ch in t]
+    norm = "".join(cleaned)
+    compact = re.sub(r"[\s\.\,\-\_\*\#\/\\]+", "", norm)
+    return f"{norm} {compact}"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -217,6 +248,7 @@ def init_db():
     );
     CREATE TABLE IF NOT EXISTS required (chat TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS recent_posts (channel_id INTEGER, text TEXT, created_at TEXT);
+    CREATE TABLE IF NOT EXISTS recent_images (channel_id INTEGER, image_key TEXT, created_at TEXT);
     CREATE TABLE IF NOT EXISTS chat_insights (
         id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id INTEGER, user_id INTEGER,
         user_name TEXT, text TEXT, created_at TEXT
@@ -238,6 +270,7 @@ def init_db():
         db.execute("PRAGMA journal_mode = WAL;")
         db.execute("PRAGMA busy_timeout = 10000;")
         db.execute("CREATE INDEX IF NOT EXISTS idx_recent_posts_channel ON recent_posts(channel_id, created_at DESC);")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_recent_images ON recent_images(channel_id, created_at DESC);")
         db.commit()
     except Exception as e_pragma:
         logging.warning(f"PRAGMA sozlamalari xatosi: {e_pragma}")
@@ -1090,6 +1123,105 @@ async def nightly_auto_backup():
 auto_restore_channels()
 
 
+# ============================ ODDIY FOYDALANUVCHILAR UCHUN SHAXSIY ZAXIRA ============================
+def create_user_backup(uid: int) -> tuple[str, bytes]:
+    """
+    Faqat berilgan foydalanuvchiga (uid) tegishli kanallar va ularning sozlamalarini
+    xavfsiz JSON qilib tayyorlaydi. Butun baza yoki boshqa odamlar ma'lumotlari kirmaydi!
+    """
+    ch_rows = q("SELECT * FROM channels WHERE owner_id=?", (uid,))
+    channels_data = []
+    for c in ch_rows:
+        c = dict(c)
+        channels_data.append({
+            "channel_id": c["channel_id"],
+            "title": c["title"],
+            "niche": c["niche"],
+            "audience": c["audience"],
+            "group_id": c["group_id"],
+            "active": c["active"],
+            "detailed_prompt": c.get("detailed_prompt", ""),
+            "custom_hours": c.get("custom_hours", ""),
+            "current_topic": c.get("current_topic", ""),
+            "arc_day": c.get("arc_day", 1),
+            "arc_total_days": c.get("arc_total_days", 3),
+            "last_cliffhanger": c.get("last_cliffhanger", "")
+        })
+
+    backup_payload = {
+        "version": "1.0",
+        "backup_type": "user_personal_backup",
+        "user_id": uid,
+        "created_at": now_utc().isoformat(),
+        "channels_count": len(channels_data),
+        "channels": channels_data
+    }
+    
+    filename = f"user_backup_{uid}_{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}.json"
+    content_bytes = json.dumps(backup_payload, ensure_ascii=False, indent=2).encode("utf-8")
+    return filename, content_bytes
+
+
+def restore_user_backup(uid: int, json_data: dict) -> tuple[bool, str]:
+    """
+    Foydalanuvchi yuborgan shaxsiy zaxirani tekshirib tiklaydi.
+    XAVFSIZLIK: user_id aynan shu foydalanuvchiniki ekanligi qat'iy tekshiriladi!
+    """
+    if not isinstance(json_data, dict):
+        return False, "❌ Fayl formati noto'g'ri (JSON obyekt emas)."
+    
+    file_uid = json_data.get("user_id")
+    if not file_uid or int(file_uid) != uid:
+        return False, "⛔ <b>Xavfsizlik xatosi:</b> Ushbu zaxira fayli boshqa foydalanuvchiga tegishli! Begona zaxirani tiklash taqiqlangan."
+        
+    channels = json_data.get("channels", [])
+    if not isinstance(channels, list):
+        return False, "❌ Kanallar ro'yxati topilmadi."
+
+    sub = get_user_subscription(uid)
+    plan_info = sub["plan_info"]
+    max_channels = plan_info.get("channels", 1)
+
+    restored_count = 0
+    for ch in channels:
+        cid = ch.get("channel_id")
+        if not cid:
+            continue
+            
+        # Agar kanal bazada boshqa odam nomida bo'lsa (o'g'irlashdan qat'iy himoya)
+        existing = q("SELECT owner_id FROM channels WHERE channel_id=?", (cid,), one=True)
+        if existing and existing["owner_id"] != uid and not is_admin(uid):
+            continue
+            
+        q("""INSERT INTO channels (
+                channel_id, owner_id, title, niche, audience, group_id, active,
+                detailed_prompt, custom_hours, current_topic, arc_day, arc_total_days, last_cliffhanger, created_at
+             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(channel_id) DO UPDATE SET
+                owner_id=excluded.owner_id,
+                title=excluded.title,
+                niche=excluded.niche,
+                audience=excluded.audience,
+                group_id=excluded.group_id,
+                active=excluded.active,
+                detailed_prompt=excluded.detailed_prompt,
+                custom_hours=excluded.custom_hours,
+                current_topic=excluded.current_topic,
+                arc_day=excluded.arc_day,
+                arc_total_days=excluded.arc_total_days,
+                last_cliffhanger=excluded.last_cliffhanger""",
+          (
+              cid, uid, ch.get("title", "Kanal"), ch.get("niche", "Umumiy"), ch.get("audience", "Barcha"),
+              ch.get("group_id"), ch.get("active", 1), ch.get("detailed_prompt", ""), ch.get("custom_hours", ""),
+              ch.get("current_topic", ""), ch.get("arc_day", 1), ch.get("arc_total_days", 3), ch.get("last_cliffhanger", ""),
+              now_utc().isoformat()
+          ), commit=True)
+        restored_count += 1
+        
+    auto_backup_channels()
+    return True, f"✅ <b>Shaxsiy zaxirangiz muvaffaqiyatli tiklandi!</b>\n\nTiklandi: <b>{restored_count} ta</b> kanal va ularning barcha shaxsiy sozlamalari."
+
+
 # ============================ KANAL HAVOLALARINI TOZALASH ============================
 def clean_channel_input(text: str):
     text = text.strip()
@@ -1127,6 +1259,7 @@ MENU = types.ReplyKeyboardMarkup(
     keyboard=[
         [types.KeyboardButton(text="➕ Kanal ulash"), types.KeyboardButton(text="📺 Kanallarim")],
         [types.KeyboardButton(text="💎 Tariflar & To'lov"), types.KeyboardButton(text="👤 Profilim")],
+        [types.KeyboardButton(text="💾 Shaxsiy Zaxira")],
     ],
     resize_keyboard=True,
 )
@@ -1187,6 +1320,10 @@ class AdminCard(StatesGroup):
 
 
 class AdminRestore(StatesGroup):
+    file = State()
+
+
+class UserRestore(StatesGroup):
     file = State()
 
 
@@ -1395,6 +1532,105 @@ async def buy(cb: types.CallbackQuery, state: FSMContext):
 async def cancel(m: types.Message, state: FSMContext):
     await state.clear()
     await m.answer("❌ <b>Amaliyot bekor qilindi.</b>", reply_markup=MENU if m.chat.type == "private" else None)
+
+
+# ============================ SHAXSIY ZAXIRA HANDLERLARI ============================
+@dp.message(F.chat.type == "private", F.text.in_({"💾 Shaxsiy Zaxira", "💾 Mening Zaxira Faylim", "/backup"}))
+async def user_backup_menu(m: types.Message, state: FSMContext):
+    await state.clear()
+    uid = m.from_user.id
+    ch_rows = q("SELECT COUNT(*) as c FROM channels WHERE owner_id=?", (uid,), one=True)
+    ch_count = ch_rows["c"] if ch_rows else 0
+    text = (
+        "💾 <b>SHAXSIY MA'LUMOTLAR VA KANALLAR ZAXIRASI</b>\n\n"
+        f"Ushbu bo'lim orqali siz faqat o'zingiz ulagan kanallar, ularning maxsus AI promptlari, "
+        f"post soatlari va seriya sozlamalarini xavfsiz JSON fayl sifatida yuklab olishingiz "
+        f"yoki avval saqlangan shaxsiy zaxirangizdan qayta tiklashingiz mumkin.\n\n"
+        f"📊 <b>Sizning kanallaringiz soni:</b> <b>{ch_count} ta</b>\n"
+        f"🔒 <i>Xavfsizlik: Zaxira fayli qat'iy sizning ID raqamingizga bog'langan. Boshqa hech kim uni o'z hisobiga yuklay olmaydi va kanallaringizni tortib ololmaydi.</i>\n\n"
+        "Kerakli amalni tanlang 👇"
+    )
+    kb = ik(
+        [("📤 Zaxira faylini olish (Export)", "user_bk:export")],
+        [("📥 Zaxiradan tiklash (Import)", "user_bk:restore")]
+    )
+    await m.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "user_bk:export")
+async def user_bk_export_handler(cb: types.CallbackQuery):
+    uid = cb.from_user.id
+    ch_rows = q("SELECT COUNT(*) as c FROM channels WHERE owner_id=?", (uid,), one=True)
+    count = ch_rows["c"] if ch_rows else 0
+    if count == 0:
+        return await cb.answer("Sizda hali ulangan kanallar mavjud emas! Avval «➕ Kanal ulash» orqali kanal ulang.", show_alert=True)
+    
+    filename, content_bytes = create_user_backup(uid)
+    file_doc = types.BufferedInputFile(content_bytes, filename=filename)
+    caption = (
+        f"💾 <b>SIZNING SHAXSIY ZAXIRA FAYLINGIZ</b>\n\n"
+        f"👤 <b>Foydalanuvchi ID:</b> <code>{uid}</code>\n"
+        f"📁 <b>Fayl nomi:</b> <code>{filename}</code>\n"
+        f"📢 <b>Saqlangan kanallar:</b> <b>{count} ta</b>\n"
+        f"📅 <b>Sana:</b> <code>{datetime.now(TZ).strftime('%d.%m.%Y %H:%M:%S')}</code>\n\n"
+        f"📌 <i>Ushbu faylni saqlab qo'ying. Istalgan vaqtda botda '📥 Zaxiradan tiklash' tugmasi orqali kanallaringiz va sozlamalaringizni tiklashingiz mumkin.</i>"
+    )
+    await cb.message.answer_document(file_doc, caption=caption)
+    await cb.answer("Shaxsiy zaxira fayli yuborildi!")
+
+
+@dp.callback_query(F.data == "user_bk:restore")
+async def user_bk_restore_handler(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(UserRestore.file)
+    await cb.message.answer(
+        "📥 <b>SHAXSIY ZAXIRANI QAYTA TIKLASH (RESTORE)</b>\n\n"
+        "Iltimos, avval ushbu botdan yuklab olingan shaxsiy <b>.json</b> zaxira faylingizni menga yuboring...\n\n"
+        "<i>Bekor qilish: /cancel</i>"
+    )
+    await cb.answer()
+
+
+@dp.message(UserRestore.file, F.chat.type == "private", F.document)
+async def user_bk_process_file(m: types.Message, state: FSMContext):
+    doc = m.document
+    fname = (doc.file_name or "").lower()
+    if not fname.endswith(".json"):
+        return await m.answer(
+            "❌ <b>Noto'g'ri fayl formati!</b>\n\n"
+            "Faqat <code>.json</code> formatidagi shaxsiy zaxira faylini yuboring.\n"
+            "Bekor qilish: /cancel"
+        )
+    
+    await state.clear()
+    status_msg = await m.answer("⏳ <b>Shaxsiy zaxira fayli tekshirilmoqda va tiklanmoqda...</b>")
+    
+    temp_dir = "temp_backups"
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_path = os.path.join(temp_dir, f"user_restore_{m.from_user.id}_{int(time.time())}.json")
+    
+    try:
+        file_info = await bot.get_file(doc.file_id)
+        await bot.download_file(file_info.file_path, temp_path)
+        
+        with open(temp_path, "r", encoding="utf-8") as f:
+            json_data = json.load(f)
+            
+        ok, res_text = restore_user_backup(m.from_user.id, json_data)
+        if ok:
+            await status_msg.edit_text(res_text, reply_markup=MENU)
+        else:
+            await status_msg.edit_text(f"❌ <b>Tiklash amalga oshmadi:</b>\n{res_text}", reply_markup=MENU)
+    except json.JSONDecodeError:
+        await status_msg.edit_text("❌ <b>Xatolik:</b> Yuborilgan fayl to'g'ri JSON formatida emas.", reply_markup=MENU)
+    except Exception as e:
+        logging.error(f"User restore xatosi: {e}")
+        await status_msg.edit_text(f"❌ <b>Tiklashda xatolik yuz berdi:</b> <code>{html.escape(str(e))}</code>", reply_markup=MENU)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 
 @dp.message(Pay.receipt, F.photo)
@@ -2093,7 +2329,81 @@ def generate_niche_adaptive_post_and_poll(c, theme=None):
             ["Hozirda faol ishlayapman 🔥", "Shu oy ichida boshlayman 🚀", "Hali rejalashtiryapman 🤔", "G'oya qidiryapman 💡"]
         ]
 
-    # 4. Universal / Boshqa sohalar
+    # 4. Gaming / PUBG / Kibersport
+    elif any(k in n_lower for k in ["pubg", "pabg", "geym", "game", "gaming", "oyun", "o'yin", "kibersport", "esport", "free fire", "standoff", "cs", "dota", "brawl"]):
+        yt_query = "pubg mobile uzbek darslari giroskop sprey sozlamalari"
+        yt_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(yt_query)}"
+        img_prompt = "cinematic pubg mobile battle royale intense action scene, player with level 3 helmet and backpack, holding m416 assault rifle, pochinki village background, explosive dynamic lighting, 8k render, unreal engine 5 style"
+        
+        posts = {
+            "real_cases": (
+                f"🔥 <b>Real Keys: 2 K/D dan 6+ K/D ga qanday chiqdim? (Shaxsiy tajriba)</b>\n\n"
+                f"Ko'pchilik «K/D ko'tarish uchun faqat qimmat telefon yoki iPad kerak» deb o'ylaydi. "
+                f"Lekin asosiy sir — <b>to'g'ri giroskop sensi</b> va <b>rush qilish taktikasi</b>da!\n\n"
+                f"📌 <b>Menga yordam bergan 3 ta narsa:</b>\n"
+                f"1. <b>Giroskopni 350-400% ga ko'tarish</b> — Barmoq bilan ekranni tortgandan ko'ra giroskop 3 barobar tezroq nishon oladi.\n"
+                f"2. <b>Close Combatda Jiggle + Pre-fire</b> — Dushman burchakdan chiqishidan oldin o'q otishni boshlash.\n"
+                f"3. <b>Kallani yo'qotib rush qilmaslik</b> — Har doim orqada tosh yoki devor (cover) bo'lishi shart!\n\n"
+                f"🎥 <b>Tavsiya darslik:</b> <a href=\"{yt_url}\">YouTube'da bepul PUBG darslarini ko'rish</a>\n\n"
+                f"⚡️ <i>Siz hozir qaysi rankdasiz va K/D ko'rsatkichingiz nechida? Izohda yozing!</i> 👇"
+            ),
+            "free_tools": (
+                f"🛠 <b>PUBG Mobile: 90 FPS va o'yinni qotmasdan uchirish uchun foydali maslahatlar:</b>\n\n"
+                f"O'yinda qotish (lag/drop) va qizishni kamaytirishning amaliy usullari:\n\n"
+                f"1. <b>Grafika: Smooth (Plavno) + Extreme/90 FPS</b> — Hech qachon HD yoki HDR qo'ymang, batareya qiziydi va FPS tushadi.\n"
+                f"2. <b>Audio: High (Ultra emas)</b> — Ultra audio ba'zi telefonlarda ovozni kechiktiradi va yuklama beradi.\n"
+                f"3. <b>Xotira tozalash</b> — O'yinga kirishdan oldin fondagi barcha ilovalarni yoping va xotirani bo'shating.\n"
+                f"4. <b>Keshni tozalash</b> — PUBG yuklamalari ichidagi ortiqcha resurs paketlarini o'chirib turing.\n\n"
+                f"🎥 <b>Qo'llanma:</b> <a href=\"{yt_url}\">YouTube'da FPS oshirish va sozlamalar darslari</a>\n\n"
+                f"💡 <i>Sizda o'yin necha FPS ochadi (60 FPS, 90 FPS yoki 120 FPS)?</i> 🚀"
+            ),
+            "youtube_learning": (
+                f"🎥 <b>Pro Geymer Darsi: M416 bilan 100 metrdan lazer sprey qilish siri!</b>\n\n"
+                f"Do'stlar, agar M416 bilan otganda o'q osmonga uchib ketayotgan bo'lsa, xafa bo'lmang! Spreyni nollashning aniq formulasi bor:\n\n"
+                f"📌 <b>Bajarilishi shart bo'lgan qoidalar:</b>\n"
+                f"• <code>M416 + Kompensator + Vertikal dastak (Vertical Grip) + Taktik priklad</code> — eng stabil jamlanma!\n"
+                f"• <code>6x ni 3x ga qisqartirish</code> — 6x ni to'g'ridan-to'g'ri ishlatmang, 3x ga tushirib sprey qiling.\n"
+                f"• <code>O'tirib otish (Crouch)</code> — O'tirganda qurol rekoili (otdacha) 50% ga kamayadi!\n\n"
+                f"👉 <a href=\"{yt_url}\">🎥 YouTube'da giroskop va sprey darslarini ko'rish</a>\n\n"
+                f"<i>Trenirovka zonasida kuniga 15 daqiqa sprey mashq qilsangiz, natijaga o'zingiz qoyil qolasiz!</i> 🎯"
+            ),
+            "interactive_game": (
+                f"🎮 <b>Geymerlar uchun test: 1v4 vaziyatda nima qilasiz?</b>\n\n"
+                f"Tasavvur qiling: Squadingiz o'lgan, siz Butkemp asosiy binosidasiz. 4 kishilik to'liq dushman jamoasi siz tomonga rush qilyapti!\n\n"
+                f"A) Zinaga granata (Nade) yoki Molotov tashlab, UZI/DBS bilan bittalab kutib olaman.\n"
+                f"B) Derazadan sakrab orqa tarafdan aylanib o'tib (flank) kutilmaganda zarba beraman.\n"
+                f"C) Bitta burchakda yotib olib (kempir qilib) dushmanni poylayman.\n\n"
+                f"Siz qaysi taktikani tanlardingiz? Quyidagi so'rovnomada ovoz bering! 👇"
+            ),
+            "funny_memes": (
+                f"😂 <b>PUBG o'ynaydigan har bir kishiga tanish holat:</b>\n\n"
+                f"— «Og'ayni, bitta kishi qoldi, rush qil, qoni bitta urushlik!» 🗣\n"
+                f"— Yugurib borsang: 4 kishi to'liq tarkib bilan kutib olib, 1 soniyada lobbiga jo'natishadi! 💀😂\n\n"
+                f"Tanish holatmi? Qoni bitta degan gapga hech qachon ishonmang! Always check corners! 🏃‍♂️💨"
+            ),
+            "expert_guide": (
+                f"💎 <b>Ekspert Maslahati: Butkemp va Pochinkida omon qolishning 3 temir qoidasi</b>\n\n"
+                f"1. <b>Parashyutdan eng tez tushish (234 km/soat)</b> — Qurolni birinchi olgan odam lokatsiyani nazorat qiladi.\n"
+                f"2. <b>Quloqchin (Naushnik) va tovush</b> — Dushmanning qadam tovushini (footsteps) eshitmasdan harakat qilmang.\n"
+                f"3. <b>Ochiq maydonda yugurmaslik</b> — Har bir harakat coverdan coverga (boshpanadan boshpanaga) bo'lishi shart.\n\n"
+                f"🎥 <b>Tavsiya:</b> <a href=\"{yt_url}\">YouTube'da Pochinki va Butkemp taktikalarini ko'rish</a>"
+            )
+        }
+        
+        poll_q_list = [
+            "Siz PUBG Mobile'da qaysi qurilmada o'ynaysiz? 📱",
+            "Yaqin masofada (Close Combat) siz uchun qaysi qurol eng kuchli? 💥",
+            "Sizning PUBG dagi hozirgi K/D ko'rsatkichingiz qancha? 📊",
+            "Siz ko'proq qaysi xaritada o'ynaysiz? 🗺"
+        ]
+        poll_opts_list = [
+            ["Telefon (Android / iPhone) 📱", "iPad / Planshet 📟", "PC (Emulyator) 🖥", "Hali o'ynamayman 👀"],
+            ["DBS / Shotgun 🔥", "M416 (Stabil sprey) 🎯", "UZI / Vector (Tezkor otish) ⚡️", "AKM / Beryl M762 (Katta damage) 💣"],
+            ["5+ K/D (Kibersportchi) 🏆", "3 - 5 K/D (Tajribali) ⚡️", "1.5 - 3 K/D (O'rtacha) 🎯", "1 dan past (Erkakcha rush qilaman) 😂"],
+            ["Erangel (Pochinki, Sosnovka) 🌲", "Sanhok (Butkemp, Paradise) 🌴", "Livik (Tezkor matchlar) ⚡️", "Miramar / Boshqa 🏜"]
+        ]
+
+    # 5. Universal / Boshqa sohalar
     else:
         yt_query = f"{niche} o'rganish va amaliy darslar"
         yt_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(yt_query)}"
@@ -2348,6 +2658,15 @@ def extract_post_from_text(raw_text: str, c: dict = None, fallback_theme: str = 
 
 
 NICHE_ANGLES = {
+    "gaming": [
+        "PUBG Mobile: Yaqin masofada (Close combat) M416 bilan to'g'ri jiggle va pre-fire qilish sirlari",
+        "Giroskop sensini (sezgirlik) o'zingizga moslash: Rekoilni (otdacha) nollash va 6x sprey sirlari",
+        "Butkemp va Pochinkiga tushganda omon qolish va 1v4 clutch qilishning 3 qoidasi",
+        "90 FPS va iPad Mini: Qurilma fiti va o'yin ravonligining K/D ga ta'siri",
+        "Zonaga to'g'ri kirish (Zone rotation) va Airdropni xavfsiz loot qilish taktikasi",
+        "DBS va UZI: Yaqin jangda dushmanni 1 soniyada yanchib tashlash usullari",
+        "Rank ko'tarishda (Ace Dominator / Conqueror) eng ko'p qilinadigan xatolar"
+    ],
     "it": [
         "Dasturlashda charchoq (burnout) bilan kurashish va motivatsiyani tiklash",
         "2026-yilgi yangi avlod AI instrumentlari va dasturchi ish tezligi",
@@ -2417,7 +2736,9 @@ async def ai_generate_full(c):
     
     # 2. Har safar aniq bitta yangi sub-mavzu yoki burchak (angle) tanlash
     n_lower = f"{c.get('niche', '')} {c.get('detailed_prompt', '')}".lower()
-    if any(k in n_lower for k in ["treding", "trading", "kripto", "crypto", "forex", "valyuta"]):
+    if any(k in n_lower for k in ["pubg", "pabg", "geym", "game", "gaming", "oyun", "o'yin", "kibersport", "esport", "free fire", "standoff", "cs", "dota", "brawl"]):
+        niche_key = "gaming"
+    elif any(k in n_lower for k in ["treding", "trading", "kripto", "crypto", "forex", "valyuta"]):
         niche_key = "crypto"
     elif any(k in n_lower for k in ["bot", "sayt", "dastur", "python", "web", "kod", "developer", "it"]):
         niche_key = "it"
@@ -2537,11 +2858,24 @@ Post yozishdan oldin «{c.get('niche', '')}» va «{current_topic}» mavzusi bo'
     theme_instructions = {
         "real_cases": "Mavzu: REAL KEYS VA MUVAFFAQIYAT! Shu kanal mavzusida birov qanday qilib natijaga/daromadga chiqqani, qanday loyiha qilgani haqida hikoya. Obunachilarni ham yangilik yaratishga chorla: «Sizlar ham o'zingizcha biror g'oya o'ylab ko'ring, yaratib ko'ring!».",
         "free_tools": "Mavzu: BEPUL INSTRUMENTLAR VA VOSITALAR! Shu soha bo'yicha tekin dasturlar, xostinglar, platformalar va vositalar haqida aniq, foydali tavsiyalar.",
-        "youtube_learning": "Mavzu: YOUTUBE VA INTERNET DARSLIKLARI! Xuddi onadek/ustozdek mehribonlik bilan, obunachilar ko'proq narsa o'rganishi uchun YouTube'dagi qidirish kerak bo'lgan eng foydali darslar va bilim manbalarini tavsiya qil.",
+        "youtube_learning": "Mavzu: YOUTUBE VA INTERNET DARSLIKLARI! Obunachilar ko'proq narsa o'rganishi uchun YouTube'dagi qidirish kerak bo'lgan eng foydali darslar va amaliy bilim manbalarini tavsiya qil.",
         "interactive_game": "Mavzu: QIZIQARLI O'YIN VA TOPISHMOQ! Auditoriya bilan shu soha bo'yicha mantiqiy o'yin, qiziqarli topishmoq yoki test o'tkaz.",
         "funny_memes": "Mavzu: KULGILI HAYOTIY MEM VA VOQEA! Shu sohadagi qiziqarli hayotiy holat, mutaxassislar uchraydigan kulgili voqea va kayfiyat ko'taruvchi gaplar.",
         "expert_guide": "Mavzu: AMALIY EKSPERT MASLAHATI! Foydalanuvchining kanal mavzusi bo'yicha eng zarur, qimmatli va amaliy qo'llanma."
     }
+
+    if niche_key == "gaming":
+        gaming_instruction = """🕹 GEYMERLAR TILI VA MAZMUN QOIDALARI (PUBG & GAMING):
+• TIL: Jonli o'zbek geymerlari tili (ruscha-o'zbekcha aralash tabiiy geymer jargonlari: Giroskop, Sens (sezgirlik), Rush, K/D, Butkemp, Pochinki, Sprayer, Rekoil / Otdaсha, 90 FPS, iPad Mini / Telefon fiti, X-Suit, Airdrop, Clutch 1v4, Zone rotation, M416+6x, DBS, UZI, Pre-fire, Jiggle).
+• QAT'IY TAQIQLANGAN SO'ZLAR: "Avtomatik kallak oqi", "gulfamni hisoblanish", "Shift+Tab" (mobil o'yinda kompyuter tugmalari), "hayotdan boryapti", "oltin olti POLTA" kabi sun'iy, kulgili va harfma-harf robot tarjimalar MUTLAQO TAQIQLANADI!
+• MAZMUN: Quruq gap emas, AMALIY TAKTIK FOYDA bersin (masalan: "Yaqin masofada M416 bilan qanday sprey qilish kerak?", "Giroskop sensini to'g'irlash siri", "Butkempga tushganda omon qolishning 3 qoidasi", "Close combatda jiggle va pre-fire sirlari").
+• SO'ROVNOMA: Geymerlar K/D ko'rsatkichi, qurilmasi (iPad / Telefon) yoki sevimli quroli haqida bo'lsin."""
+        tone_line = "1. O'zbek tilida, professional va jonli geymer tilida (slanglar bilan), dinamik, qiziqarli va amaliy foydali tilda yoz (400-800 belgi). Hech qanday robot tarjima ishlatma!"
+        img_style_line = '7. image_prompt: Ingliz tilida jangovar va dinamik uslubda yoz (masalan: "cinematic pubg battle royale intense fight scene, dynamic lighting, 8k render, unreal engine 5").'
+    else:
+        gaming_instruction = ""
+        tone_line = "1. O'zbek tilida, nihoyatda samimiy, onadek g'amxo'r, rag'batlantiruvchi va jonli tilda yoz (400-800 belgi)."
+        img_style_line = f'7. image_prompt: Ingliz tilida, ushbu uslubda yoz: "{style}".'
     
     prompt = f"""Sen «{c['title']}» kanalining eng iqtidorli, jonkuyar va professional bosh muharririsan.
 Kanal yo'nalishi: {c['niche']}
@@ -2549,6 +2883,8 @@ Auditoriya: {c['audience']}
 
 AI UCHUN ASOSIY YO'RIQNOMA (PROMPT):
 {c['detailed_prompt'] or "Kanal mavzusiga mos eng foydali va qiziqarli narsalarni yoritish."}
+
+{gaming_instruction}
 
 {arc_instruction}
 👉 Format yo'nalishi: {theme_instructions.get(theme)}
@@ -2565,13 +2901,13 @@ Guruhdagi muhokamalar va a'zolar qiziqishlari:
 {insights}
 
 MUHIM TALABLAR:
-1. O'zbek tilida, nihoyatda samimiy, onadek g'amxo'r, rag'batlantiruvchi va jonli tilda yoz (400-800 belgi).
+{tone_line}
 2. Dastlabki 1-2 qatorda diqqatni tortuvchi kuchli sarlavha (Hook / Pattern Interrupt).
 3. Asosiy qism: qisqa, bo'limlarga bo'lingan, ortiqcha suvsiz mazmun.
 4. Matn shriftlari faqat Telegram ruxsat bergan HTML teglari bilan: qalin (<b>...</b>), muhim jumlalar (<i>...</i>), parametr va kodlar (<code>...</code>). Hech qachon <br>, <p>, <div> ishlatma!
 5. poll_question: Aynan «{c['title']}» kanali mavzusi ({c['niche']}) bo'yicha 1 ta o'ta qiziq so'rovnoma savoli (maksimal 200 belgi).
 6. poll_options: Ushbu savolga mos 3-4 ta takrorlanmas variant.
-7. image_prompt: Ingliz tilida, ushbu uslubda yoz: "{style}".
+{img_style_line}
 
 Javobni FAQAT toza JSON formatida qaytar:
 {{
@@ -2644,45 +2980,136 @@ Javobni FAQAT toza JSON formatida qaytar:
 
 
 # ============================ XILMA-XIL RASMLAR YARATISH VA YUKLASH ============================
-async def download_post_image(prompt: str, niche: str):
-    mode = random.choice(["flux_ai", "web_photo"])
-    
-    # 1. Flux AI orqali yaratish
-    if mode == "flux_ai":
+NICHE_CURATED_WALLPAPERS = {
+    "gaming": [
+        "https://images.unsplash.com/photo-1542751371-adc38448a05e?auto=format&fit=crop&w=1280&q=80",  # Neon gaming setup
+        "https://images.unsplash.com/photo-1538481199705-c710c4e965fc?auto=format&fit=crop&w=1280&q=80",  # Cyber battle station
+        "https://images.unsplash.com/photo-1511512578047-dfb367046420?auto=format&fit=crop&w=1280&q=80",  # Gamepad dark
+        "https://images.unsplash.com/photo-1550745165-9bc0b252726f?auto=format&fit=crop&w=1280&q=80",  # Retro neon arcade
+        "https://images.unsplash.com/photo-1560253023-3ec5d502959f?auto=format&fit=crop&w=1280&q=80",  # Esports arena
+        "https://images.unsplash.com/photo-1579373903781-fd5c0c30c4cd?auto=format&fit=crop&w=1280&q=80",  # Cyber action glow
+        "https://images.unsplash.com/photo-1612287233215-6134b2239d56?auto=format&fit=crop&w=1280&q=80",  # Controller red
+        "https://images.unsplash.com/photo-1593305841991-05c297ba4575?auto=format&fit=crop&w=1280&q=80",  # Pro gamer display
+        "https://images.unsplash.com/photo-1526509867162-5b0c0d1b4b33?auto=format&fit=crop&w=1280&q=80",  # Dark gaming ambiance
+        "https://images.unsplash.com/photo-1578632767115-351597cf2477?auto=format&fit=crop&w=1280&q=80"   # Anime cyberpunk
+    ],
+    "crypto": [
+        "https://images.unsplash.com/photo-1621416894569-0f39ed31d247?auto=format&fit=crop&w=1280&q=80",  # Bitcoin dark
+        "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?auto=format&fit=crop&w=1280&q=80",  # Trading chart
+        "https://images.unsplash.com/photo-1642543492481-44e81e3914a7?auto=format&fit=crop&w=1280&q=80",  # Crypto coin gold
+        "https://images.unsplash.com/photo-1622979135225-d2ba269bc1df?auto=format&fit=crop&w=1280&q=80",  # Ethereum dark
+        "https://images.unsplash.com/photo-1590283603385-17ffb3a7f29f?auto=format&fit=crop&w=1280&q=80",  # Market analysis
+        "https://images.unsplash.com/photo-1559526324-4b87b5e36e44?auto=format&fit=crop&w=1280&q=80"   # Finance growth
+    ],
+    "it": [
+        "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=1280&q=80",  # Hardware chip
+        "https://images.unsplash.com/photo-1498050108023-c5249f4df085?auto=format&fit=crop&w=1280&q=80",  # Code laptop
+        "https://images.unsplash.com/photo-1526374965328-7f61d4dc18c5?auto=format&fit=crop&w=1280&q=80",  # Matrix binary
+        "https://images.unsplash.com/photo-1550751827-4bd374c3f58b?auto=format&fit=crop&w=1280&q=80",  # Cybersecurity
+        "https://images.unsplash.com/photo-1504384308090-c894fdcc538d?auto=format&fit=crop&w=1280&q=80",  # Clean workspace
+        "https://images.unsplash.com/photo-1551288049-bebda4e38f71?auto=format&fit=crop&w=1280&q=80",  # Data dashboard
+        "https://images.unsplash.com/photo-1461749280684-dccba630e2f6?auto=format&fit=crop&w=1280&q=80"   # Code screen
+    ],
+    "business": [
+        "https://images.unsplash.com/photo-1486406146926-c627a92ad1ab?auto=format&fit=crop&w=1280&q=80",  # Modern skyscrapers
+        "https://images.unsplash.com/photo-1454165804606-c3d57bc86b40?auto=format&fit=crop&w=1280&q=80",  # Business strategy
+        "https://images.unsplash.com/photo-1507679799987-c73779587ccf?auto=format&fit=crop&w=1280&q=80",  # Executive suit
+        "https://images.unsplash.com/photo-1519389950473-47ba0277781c?auto=format&fit=crop&w=1280&q=80",  # Startup team
+        "https://images.unsplash.com/photo-1553729459-efe14ef6055d?auto=format&fit=crop&w=1280&q=80"   # Finance banking
+    ],
+    "universal": [
+        "https://images.unsplash.com/photo-1497633762265-9d179a990aa6?auto=format&fit=crop&w=1280&q=80",  # Library books
+        "https://images.unsplash.com/photo-1434030216411-0b793f4b4173?auto=format&fit=crop&w=1280&q=80",  # Study notes
+        "https://images.unsplash.com/photo-1506744038136-46273834b3fb?auto=format&fit=crop&w=1280&q=80",  # Landscape nature
+        "https://images.unsplash.com/photo-1519681393784-d120267933ba?auto=format&fit=crop&w=1280&q=80"   # Starry mountain
+    ]
+}
+
+
+async def download_post_image(prompt: str, niche: str, channel_id: int = 0) -> bytes | None:
+    # 0. Kanalning oxirgi 30 ta rasmlari keshini olish (takrorlanishni 100% oldini olish)
+    used_keys = set()
+    if channel_id:
         try:
-            seed = random.randint(1000, 99999999)
-            encoded = urllib.parse.quote(prompt[:300])
+            rows = q("SELECT image_key FROM recent_images WHERE channel_id=? ORDER BY created_at DESC LIMIT 30", (channel_id,))
+            used_keys = {r["image_key"] for r in rows if r["image_key"]}
+        except Exception as e_rk:
+            logging.warning(f"recent_images o'qish xatosi: {e_rk}")
+
+    # Niche toifasini aniqlash
+    n_lower = f"{niche} {prompt}".lower()
+    if any(k in n_lower for k in ["pubg", "pabg", "geym", "game", "gaming", "oyun", "o'yin", "kibersport", "esport", "free fire", "standoff", "cs", "dota"]):
+        niche_cat = "gaming"
+    elif any(k in n_lower for k in ["treding", "trading", "kripto", "crypto", "forex", "valyuta"]):
+        niche_cat = "crypto"
+    elif any(k in n_lower for k in ["bot", "sayt", "dastur", "python", "web", "kod", "developer", "it"]):
+        niche_cat = "it"
+    elif any(k in n_lower for k in ["biznes", "startap", "savdo", "marketing", "sotuv", "daromad"]):
+        niche_cat = "business"
+    else:
+        niche_cat = "universal"
+
+    # 1. Flux AI orqali har xil seed va prompt bilan generatsiya qilish
+    p_clean = (prompt or niche).strip()
+    if niche_cat == "gaming":
+        flux_prompt = f"{p_clean}, cinematic intense battle royale action scene, pochinki military background, dramatic lighting, 8k render, unreal engine 5"
+    else:
+        flux_prompt = f"{p_clean}, high quality professional photography, 8k, cinematic lighting"
+
+    # 2 martagacha turli seed bilan Flux AI urinishi
+    for _ in range(2):
+        try:
+            seed = random.randint(100000, 999999999)
+            encoded = urllib.parse.quote(flux_prompt[:320])
             url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&model=flux&seed={seed}&nologo=true"
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                     if resp.status == 200:
                         data = await resp.read()
                         if len(data) > 8000:
-                            return data
-        except Exception as e:
-            logging.warning(f"Flux AI rasmda kechikish: {e}")
+                            img_key = hashlib.md5(data[:4096]).hexdigest()
+                            if img_key not in used_keys:
+                                if channel_id:
+                                    try:
+                                        q("INSERT INTO recent_images (channel_id, image_key, created_at) VALUES (?, ?, ?)",
+                                          (channel_id, img_key, now_utc().isoformat()), commit=True)
+                                        q("DELETE FROM recent_images WHERE channel_id=? AND rowid NOT IN (SELECT rowid FROM recent_images WHERE channel_id=? ORDER BY created_at DESC LIMIT 30)",
+                                          (channel_id, channel_id), commit=True)
+                                    except Exception as e_si:
+                                        logging.warning(f"recent_images yozish xatosi: {e_si}")
+                                return data
+        except Exception as e_flux:
+            logging.warning(f"Flux AI rasm olishda urinish: {e_flux}")
+            break
 
-    # 2. Internetdan yuqori aniqlikdagi haqiqiy fotosurat
-    img_urls = [
-        "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=1280&q=80",
-        "https://images.unsplash.com/photo-1498050108023-c5249f4df085?auto=format&fit=crop&w=1280&q=80",
-        "https://images.unsplash.com/photo-1526374965328-7f61d4dc18c5?auto=format&fit=crop&w=1280&q=80",
-        "https://images.unsplash.com/photo-1550751827-4bd374c3f58b?auto=format&fit=crop&w=1280&q=80",
-        "https://images.unsplash.com/photo-1504384308090-c894fdcc538d?auto=format&fit=crop&w=1280&q=80",
-        "https://images.unsplash.com/photo-1551288049-bebda4e38f71?auto=format&fit=crop&w=1280&q=80",
-        f"https://picsum.photos/1280/720?random={random.randint(1, 9999)}"
-    ]
-    random.shuffle(img_urls)
-    for u in img_urls[:3]:
+    # 2. Agar Flux AI ishlamasa yoki takrorlangan bo'lsa -> Yo'nalishga mos Curated Wallpapers & Web Photo
+    pool = list(NICHE_CURATED_WALLPAPERS.get(niche_cat, NICHE_CURATED_WALLPAPERS["universal"]))
+    # Dinamik yangi rasm manbalarini ham qo'shish
+    pool.append(f"https://picsum.photos/1280/720?random={random.randint(1, 999999)}")
+    random.shuffle(pool)
+
+    for u in pool:
+        u_key = hashlib.md5(u.encode("utf-8")).hexdigest()
+        if u_key in used_keys:
+            continue
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(u, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                     if resp.status == 200:
                         data = await resp.read()
                         if len(data) > 8000:
+                            if channel_id:
+                                try:
+                                    q("INSERT INTO recent_images (channel_id, image_key, created_at) VALUES (?, ?, ?)",
+                                      (channel_id, u_key, now_utc().isoformat()), commit=True)
+                                    q("DELETE FROM recent_images WHERE channel_id=? AND rowid NOT IN (SELECT rowid FROM recent_images WHERE channel_id=? ORDER BY created_at DESC LIMIT 30)",
+                                      (channel_id, channel_id), commit=True)
+                                except Exception as e_si2:
+                                    logging.warning(f"recent_images yozish xatosi: {e_si2}")
                             return data
         except Exception:
             continue
+
     return None
 
 
@@ -2751,7 +3178,7 @@ async def send_ai_post(c, with_image=True):
         # 1. Rasm bilan yuborish
         if with_image:
             try:
-                img_bytes = await download_post_image(img_prompt or c.get("niche", ""), c.get("niche", ""))
+                img_bytes = await download_post_image(img_prompt or c.get("niche", ""), c.get("niche", ""), channel_id=cid)
                 if img_bytes:
                     photo_file = types.BufferedInputFile(img_bytes, filename="post_image.jpg")
                     if len(safe_html) <= 1020:
@@ -3038,13 +3465,35 @@ async def delete_later(msg: types.Message, sec=20):
 
 
 async def handle_violation(m: types.Message, chat_id: int, reason_text: str, is_vip: bool = False):
-    uid = m.from_user.id
-    mention = m.from_user.mention_html()
+    sender_chat = m.sender_chat
+    user = m.from_user
     
+    # 1. Xabarni darhol o'chirish
     try:
         await m.delete()
-    except Exception:
-        pass
+    except Exception as e_del:
+        logging.warning(f"Xabarni o'chirish imkoni bo'lmadi ({chat_id}): {e_del}")
+
+    # Agar qoidabuzarlik kanal nomidan qilingan bo'lsa
+    if sender_chat and sender_chat.id != chat_id:
+        try:
+            await bot.ban_chat_sender_chat(chat_id, sender_chat.id)
+            punish_msg = await bot.send_message(
+                chat_id,
+                f"🛡 <b>ANTISPAM:</b>\n"
+                f"⛔ <b>{html.escape(sender_chat.title or 'Kanal')}</b> nomidan spam yuborilgani sababli ushbu kanal guruhda <b>bloklandi (BAN)!</b>"
+            )
+            asyncio.create_task(delete_later(punish_msg, 25))
+            return
+        except Exception as e_ch_ban:
+            logging.error(f"Kanalni ban qilishda xato ({chat_id}): {e_ch_ban}")
+            return
+
+    if not user:
+        return
+
+    uid = user.id
+    mention = user.mention_html()
 
     # VIP Moderatsiya: Spam, stavka, scam havolalar va firibgarlarni darhol guruhdan ban qilish
     if is_vip:
@@ -3052,14 +3501,15 @@ async def handle_violation(m: types.Message, chat_id: int, reason_text: str, is_
         try:
             await bot.ban_chat_member(chat_id, uid)
             q("DELETE FROM violations WHERE chat_id=? AND user_id=?", (chat_id, uid), commit=True)
-            punish_msg = await m.answer(
+            punish_msg = await bot.send_message(
+                chat_id,
                 f"🛡 <b>VIP MODERATSIYA (MAX BIZNES):</b>\n"
                 f"⛔ {mention} firibgarlik, stavka yoki spam tarqatgani sababli <b>darhol guruhdan chiqarildi (BAN)!</b>"
             )
             asyncio.create_task(delete_later(punish_msg, 25))
             return
         except Exception as e:
-            logging.error(f"VIP ban xatosi: {e}")
+            logging.error(f"VIP ban xatosi ({chat_id}): {e}")
         
     r = q("SELECT warnings, cycle FROM violations WHERE chat_id=? AND user_id=?", (chat_id, uid), one=True)
     warns, cycle = (r["warnings"], r["cycle"]) if r else (0, 0)
@@ -3070,42 +3520,67 @@ async def handle_violation(m: types.Message, chat_id: int, reason_text: str, is_
 
     if warns < 3:
         q("INSERT OR REPLACE INTO violations VALUES (?,?,?,?)", (chat_id, uid, warns, cycle), commit=True)
-        warn_msg = await m.answer(
-            f"⚠️ {mention}, <b>{reason_text}!</b>\n"
-            f"📌 Sizga ogohlantirish berildi: <code>{warns}/3</code>\n"
-            f"<i>(Ushbu ogohlantirish 20 soniyada o'chiriladi)</i>"
-        )
-        asyncio.create_task(delete_later(warn_msg, 20))
+        try:
+            warn_msg = await bot.send_message(
+                chat_id,
+                f"⚠️ {mention}, <b>{reason_text}!</b>\n"
+                f"📌 Sizga ogohlantirish berildi: <code>{warns}/3</code>\n"
+                f"<i>(Ushbu ogohlantirish 20 soniyada o'chiriladi)</i>"
+            )
+            asyncio.create_task(delete_later(warn_msg, 20))
+        except Exception as e_warn:
+            logging.warning(f"Ogohlantirish yuborishda xato ({chat_id}): {e_warn}")
         return
 
     # Guruh cheklovlari va banlar sonini yangilash
     q("UPDATE channels SET bans = bans + 1 WHERE group_id=?", (chat_id,), commit=True)
+    restrict_perms = types.ChatPermissions(
+        can_send_messages=False,
+        can_send_audios=False,
+        can_send_documents=False,
+        can_send_photos=False,
+        can_send_videos=False,
+        can_send_video_notes=False,
+        can_send_voice_notes=False,
+        can_send_polls=False,
+        can_send_other_messages=False,
+        can_add_web_page_previews=False,
+    )
     try:
         if cycle == 0:
             q("INSERT OR REPLACE INTO violations VALUES (?,?,?,?)", (chat_id, uid, 0, 1), commit=True)
+            until_ts = int((now_utc() + timedelta(days=30)).timestamp())
             await bot.restrict_chat_member(
                 chat_id, uid,
-                permissions=types.ChatPermissions(can_send_messages=False),
-                until_date=now_utc() + timedelta(days=30)
+                permissions=restrict_perms,
+                until_date=until_ts,
+                use_independent_chat_permissions=True
             )
-            punish_msg = await m.answer(f"⛔ {mention} <b>3 marta ogohlantirildi va 30 kunga yozishdan cheklandi!</b>")
+            punish_msg = await bot.send_message(chat_id, f"⛔ {mention} <b>3 marta ogohlantirildi va 30 kunga yozishdan cheklandi!</b>")
         else:
             await bot.ban_chat_member(chat_id, uid)
             q("DELETE FROM violations WHERE chat_id=? AND user_id=?", (chat_id, uid), commit=True)
-            punish_msg = await m.answer(f"🚫 {mention} <b>qoidani surunkali buzgani sababli guruhdan chiqarib yuborildi!</b>")
+            punish_msg = await bot.send_message(chat_id, f"🚫 {mention} <b>qoidani surunkali buzgani sababli guruhdan chiqarib yuborildi!</b>")
         asyncio.create_task(delete_later(punish_msg, 20))
     except Exception as e:
-        logging.error(f"Foydalanuvchini cheklashda xato: {e}")
+        logging.error(f"Foydalanuvchini cheklashda xato ({chat_id}): {e}")
 
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def group_handler(m: types.Message):
-    if not m.from_user or m.from_user.is_bot or not m.text:
+    # Matn yoki rasm/video tagidagi caption ni olish
+    text_content = (m.text or m.caption or "").strip()
+    if not text_content:
         return
         
-    text_content = m.text.strip()
     chat_id = m.chat.id
+    sender_chat = m.sender_chat
+    user = m.from_user
     
+    # Botning o'zi yuborgan bo'lsa yoki boshqa bot bo'lsa (lekin ChannelBot emas)
+    if user and user.is_bot and not sender_chat:
+        return
+
     # Guruhdagi xabarlar statistikasini yangilash
     q("UPDATE channels SET group_messages = group_messages + 1 WHERE group_id=?", (chat_id,), commit=True)
     
@@ -3115,22 +3590,33 @@ async def group_handler(m: types.Message):
         sub = get_user_subscription(c["owner_id"])
         is_vip = (sub["plan_info"].get("moderation") == "vip")
 
-    is_chat_admin = await is_admin_of(chat_id, m.from_user.id)
+    # Adminlikni tekshirish
+    is_chat_admin = False
+    if sender_chat:
+        if sender_chat.id == chat_id:
+            is_chat_admin = True
+    elif user:
+        is_chat_admin = await is_admin_of(chat_id, user.id)
+
     if not is_chat_admin:
-        # So'kinish yoki haqorat
-        if PROFANITY_RE.search(text_content):
+        # Matnni normalizatsiya qilish (kirill, bo'shliqlar, leetspeak)
+        norm_text = normalize_text_for_moderation(text_content)
+        full_check_text = f"{text_content} {norm_text}"
+
+        # 1. So'kinish yoki haqorat
+        if PROFANITY_RE.search(full_check_text):
             return await handle_violation(m, chat_id, "guruhda so'kinish, haqorat va kamsitish taqiqlanadi", is_vip=False)
             
-        # Firibgarlik (masheniklik), stavka va spam
-        if SCAM_RE.search(text_content):
-            return await handle_violation(m, chat_id, "guruhda firibgarlik, spam va noqonuniy reklamalar qat'iyan man etiladi", is_vip=is_vip)
+        # 2. Firibgarlik (masheniklik), stavka, spam yoki taqiqlangan havolalar
+        if SCAM_RE.search(full_check_text):
+            return await handle_violation(m, chat_id, "guruhda firibgarlik, stavka, spam va noqonuniy reklamalar qat'iyan man etiladi", is_vip=is_vip)
     
     c = q("SELECT * FROM channels WHERE group_id=? AND active=1", (chat_id,), one=True)
     channel_id = c["channel_id"] if c else 0
     
-    if len(text_content) > 5 and not text_content.startswith("/"):
+    if user and len(text_content) > 5 and not text_content.startswith("/"):
         q("INSERT INTO chat_insights (channel_id, user_id, user_name, text, created_at) VALUES (?,?,?,?,?)",
-          (channel_id, m.from_user.id, m.from_user.full_name, text_content[:300], now_utc().isoformat()), commit=True)
+          (channel_id, user.id, user.full_name, text_content[:300], now_utc().isoformat()), commit=True)
     
     me = await bot.me()
     replied = m.reply_to_message and m.reply_to_message.from_user and m.reply_to_message.from_user.id == me.id
@@ -3179,8 +3665,9 @@ async def group_handler(m: types.Message):
         else:
             await m.reply("Savolingiz uchun katta rahmat! 🤝 Tez orada bu bo'yicha batafsil ma'lumot beramiz ✨")
     else:
+        u_name = html.escape(user.first_name if user else "do'stim")
         gratitude_responses = [
-            f"Fikringiz uchun katta rahmat, <b>{html.escape(m.from_user.first_name)}</b>! 🤝 Ushbu mavzuni kanalimizda ham tez orada yoritamiz ✨",
+            f"Fikringiz uchun katta rahmat, <b>{u_name}</b>! 🤝 Ushbu mavzuni kanalimizda ham tez orada yoritamiz ✨",
             f"Ajoyib fikr! 💡 Buni albatta inobatga olamiz, rahmat!",
             f"Savol va qiziqishingiz uchun rahmat! 🚀 Kanalimizni kuzatib boring, yangi foydali ma'lumotlar tayyorlanmoqda.",
             f"Fikr almashganingiz uchun minnatdormiz! 🤝 Bilim ulashishda davom etamiz."
