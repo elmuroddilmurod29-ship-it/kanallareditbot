@@ -19,7 +19,9 @@ import os
 import random
 import re
 import sqlite3
+import time
 import urllib.parse
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -28,6 +30,7 @@ from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -35,6 +38,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types as genai_types
 
 load_dotenv()
 
@@ -42,29 +46,92 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9210617689:AAFv_CXfwOG_Msib6M9qpjB1_Cw8oRwQipQ")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6KAlZvxYEqIFZe1BSp9ADituTrdwe5HuaiFCel53p2oUw")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "6125160021")
-ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip()}
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
+DEFAULT_YOUTUBE_API_KEY = "AIzaSyCSQrQpRA827nh4GcN6V39BVQ4PgyVYv1E"
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", DEFAULT_YOUTUBE_API_KEY).strip()
+ADMIN_IDS_RAW = os.getenv("ADMIN_ID") or os.getenv("ADMIN_IDS", "6125160021")
+ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_RAW.replace(";", ",").split(",") if x.strip() and x.strip().isdigit()}
+
+def is_admin(user_id: int) -> bool:
+    return bool(user_id and (user_id in ADMIN_IDS))
+
+AdminMsg = F.from_user.id.in_(ADMIN_IDS)
 DEFAULT_CARD_NUMBER = os.getenv("CARD_NUMBER", "8600 0000 0000 0000")
 DEFAULT_CARD_OWNER = os.getenv("CARD_OWNER", "Admin")
 TZ = ZoneInfo("Asia/Tashkent")
+BOT_START_TIME = datetime.now(TZ)
 
+def get_bot_uptime() -> str:
+    diff = datetime.now(TZ) - BOT_START_TIME
+    days = diff.days
+    hours, remainder = divmod(diff.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    parts = []
+    if days > 0:
+        parts.append(f"{days} kun")
+    if hours > 0:
+        parts.append(f"{hours} soat")
+    if minutes > 0:
+        parts.append(f"{minutes} daqiqa")
+    if not parts:
+        parts.append(f"{seconds} soniya")
+    return ", ".join(parts)
+
+# 3 ta optimal Freemium tarif modeli
 PLANS = {
-    "basic": {
-        "name": "Oddiy", "price": 10000, "channels": 1,
-        "hours": [12], "moderation": True, "ai_chat": False,
-        "desc": "1 ta kanal, kuniga 1 ta post, professional matn",
+    "start": {
+        "name": "START (Bepul)",
+        "price": 0,
+        "channels": 1,
+        "max_groups": 1,
+        "daily_post_limit": 1,
+        "hours": [12],
+        "moderation": "standard",
+        "ai_chat": False,
+        "has_grounding": False,
+        "has_youtube": False,
+        "has_cliffhanger": False,
+        "watermark": True,
+        "polls": False,
+        "desc": "1 ta kanal/guruh, kuniga 1 ta post, standart moderatsiya (0.3s), bazaviy shablonlar",
     },
-    "standard": {
-        "name": "O'rta", "price": 20000, "channels": 2,
-        "hours": [9, 14, 21], "moderation": True, "ai_chat": True,
-        "desc": "2 ta kanal, kuniga 3 ta post, AI rasmlar, guruh nazorati",
+    "pro": {
+        "name": "PRO KANAL",
+        "price": 59000,
+        "channels": 2,
+        "max_groups": 2,
+        "daily_post_limit": 3,
+        "hours": [9, 14, 21],
+        "moderation": "ai",
+        "ai_chat": True,
+        "has_grounding": True,
+        "has_youtube": False,
+        "has_cliffhanger": True,
+        "watermark": False,
+        "polls": True,
+        "desc": "2 ta kanal + 2 ta guruh, kuniga 3 ta post, Serial-Klifxenger, Google Search faktlari, reklamasiz",
     },
     "max": {
-        "name": "Maksimal VIP", "price": 30000, "channels": 5,
-        "hours": [8, 11, 14, 17, 20, 22], "moderation": True, "ai_chat": True,
-        "desc": "5 ta kanal, cheksiz AI rasm/postlar, so'rovnomalar, chat tahlili va AI moderator",
+        "name": "MAX MEDIA / BIZNES",
+        "price": 149000,
+        "channels": 5,
+        "max_groups": 999,
+        "daily_post_limit": 8,
+        "hours": [8, 10, 12, 14, 16, 18, 20, 22],
+        "moderation": "vip",
+        "ai_chat": True,
+        "has_grounding": True,
+        "has_youtube": True,
+        "has_cliffhanger": True,
+        "watermark": False,
+        "polls": True,
+        "desc": "5 ta kanal + cheksiz guruh, kuniga 8 ta post, Google + YouTube Data API trendlari, VIP moderatsiya, so'rovnomalar",
     },
 }
+# Qadimgi yozuvlar uchun moslashtirish (Backwards compatibility)
+PLANS["basic"] = PLANS["start"]
+PLANS["standard"] = PLANS["pro"]
+
 PLAN_DAYS = 30
 
 # ============================ KENGAYTIRILGAN MODERATSIYA ============================
@@ -157,7 +224,24 @@ def init_db():
     CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY, value TEXT
     );
+    CREATE TABLE IF NOT EXISTS subscriptions (
+        user_id INTEGER PRIMARY KEY,
+        plan_name TEXT DEFAULT 'start',
+        expires_at TEXT,
+        daily_posts_count INTEGER DEFAULT 0,
+        last_post_date TEXT,
+        created_at TEXT
+    );
     """)
+    # Baza barqarorligi: WAL rejimi, timeout va indekslar
+    try:
+        db.execute("PRAGMA journal_mode = WAL;")
+        db.execute("PRAGMA busy_timeout = 10000;")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_recent_posts_channel ON recent_posts(channel_id, created_at DESC);")
+        db.commit()
+    except Exception as e_pragma:
+        logging.warning(f"PRAGMA sozlamalari xatosi: {e_pragma}")
+
     for col, col_type in [
         ("detailed_prompt", "TEXT DEFAULT ''"),
         ("custom_hours", "TEXT DEFAULT ''"),
@@ -165,6 +249,10 @@ def init_db():
         ("group_messages", "INTEGER DEFAULT 0"),
         ("warnings", "INTEGER DEFAULT 0"),
         ("bans", "INTEGER DEFAULT 0"),
+        ("current_topic", "TEXT DEFAULT ''"),
+        ("arc_day", "INTEGER DEFAULT 1"),
+        ("arc_total_days", "INTEGER DEFAULT 3"),
+        ("last_cliffhanger", "TEXT DEFAULT ''"),
     ]:
         try:
             db.execute(f"ALTER TABLE channels ADD COLUMN {col} {col_type}")
@@ -176,16 +264,49 @@ def init_db():
     db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('card_number', ?)", (DEFAULT_CARD_NUMBER,))
     db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('card_owner', ?)", (DEFAULT_CARD_OWNER,))
     db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('gemini_api_key', ?)", (GEMINI_API_KEY,))
+    db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('groq_api_key', ?)", (GROQ_API_KEY,))
+    db.execute("INSERT INTO settings (key, value) VALUES ('youtube_api_key', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value IS NULL OR value=''", (YOUTUBE_API_KEY,))
+    
+    # Mavjud foydalanuvchilarni obunalar jadvaliga sinxronlash
+    try:
+        today_s = datetime.now(TZ).strftime("%Y-%m-%d")
+        db.execute("""
+            INSERT OR IGNORE INTO subscriptions (user_id, plan_name, expires_at, daily_posts_count, last_post_date, created_at)
+            SELECT user_id, 
+                   CASE 
+                     WHEN plan = 'max' THEN 'max'
+                     WHEN plan IN ('standard', 'pro') THEN 'pro'
+                     ELSE 'start'
+                   END,
+                   expires_at,
+                   0,
+                   ?,
+                   COALESCE(joined_at, '')
+            FROM users
+        """, (today_s,))
+    except Exception as e_sub_init:
+        logging.warning(f"Obunalar sinxronizatsiya xatosi: {e_sub_init}")
     db.commit()
 
 init_db()
 
 
 def q(sql, args=(), one=False, commit=False):
-    cur = db.execute(sql, args)
-    if commit:
-        db.commit()
-    return cur.fetchone() if one else cur.fetchall()
+    for attempt in range(4):
+        try:
+            cur = db.execute(sql, args)
+            if commit:
+                db.commit()
+            return cur.fetchone() if one else cur.fetchall()
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 3:
+                time.sleep(0.08 * (attempt + 1))
+                continue
+            logging.error(f"Baza xatosi (q): {e} | SQL: {sql}")
+            raise e
+        except Exception as e:
+            logging.error(f"Baza xatosi (q): {e} | SQL: {sql}")
+            raise e
 
 
 def now_utc():
@@ -250,13 +371,397 @@ async def test_gemini_key(key: str = None):
         return False, f"Ulanish xatosi: {e}"
 
 
+def get_groq_api_key():
+    try:
+        r = q("SELECT value FROM settings WHERE key='groq_api_key'", one=True)
+        if r and r["value"]:
+            return r["value"].strip()
+    except Exception:
+        pass
+    return os.getenv("GROQ_API_KEY", "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").strip()
+
+
+async def ask_groq_ai(prompt: str, system_prompt: str = None, json_mode: bool = False):
+    key = get_groq_api_key()
+    if not key:
+        return None
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json"
+    }
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    models_to_try = ["qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+    for m in models_to_try:
+        try:
+            payload = {
+                "model": m,
+                "messages": messages,
+                "max_tokens": 1200,
+                "temperature": 0.95
+            }
+            if json_mode:
+                payload["response_format"] = {"type": "json_object"}
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        choices = data.get("choices", [])
+                        if choices:
+                            msg_obj = choices[0].get("message", {})
+                            txt = (msg_obj.get("content") or "").strip()
+                            if txt:
+                                return txt
+        except Exception as e:
+            logging.warning(f"Groq ({m}) xatosi: {e}")
+            continue
+    return None
+
+
+async def test_groq_key(key: str = None):
+    test_k = key.strip() if key else get_groq_api_key()
+    if not test_k:
+        return False, "Groq kaliti kiritilmagan!"
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {test_k}", "Content-Type": "application/json"}
+    payload = {
+        "model": "qwen/qwen3.8-27b",
+        "messages": [{"role": "user", "content": "Salom"}],
+        "max_tokens": 30
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    return True, "✅ Groq AI muvaffaqiyatli ulandi va chaqmoqdek tez javob berdi!"
+                txt = await resp.text()
+                return False, f"Groq xatosi ({resp.status}): {txt[:120]}"
+    except Exception as e:
+        return False, f"Groq ulanish xatosi: {e}"
+
+
+def get_youtube_api_key():
+    try:
+        r = q("SELECT value FROM settings WHERE key='youtube_api_key'", one=True)
+        if r and r["value"] and r["value"].strip():
+            return r["value"].strip()
+    except Exception:
+        pass
+    return os.getenv("YOUTUBE_API_KEY", DEFAULT_YOUTUBE_API_KEY).strip()
+
+
+async def test_youtube_key(key: str = None):
+    test_k = key.strip() if key else get_youtube_api_key()
+    if not test_k:
+        return False, "YouTube API kaliti kiritilmagan!"
+    url = "https://www.googleapis.com/youtube/v3/search"
+    params = {"part": "snippet", "q": "test", "maxResults": 1, "key": test_k}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    return True, "✅ YouTube Data API v3 muvaffaqiyatli ulandi va so'rovga javob berdi!"
+                txt = await resp.text()
+                return False, f"YouTube API xatosi ({resp.status}): {txt[:120]}"
+    except Exception as e:
+        return False, f"YouTube ulanish xatosi: {e}"
+
+
+async def fetch_trending_youtube_videos(query: str, api_key: str = None, max_results: int = 3):
+    """
+    YouTube Data API v3 ning 'search' endpointi orqali berilgan mavzu bo'yicha
+    so'nggi 7 kundagi eng ommabop 3 ta trend videolarni tortib oladi.
+    Parametrlar:
+      - key: 'AIzaSyCSQrQpRA827nh4GcN6V39BVQ4PgyVYv1E'
+      - part: 'snippet'
+      - q: kanal mavzusi (niche)
+      - type: 'video'
+      - order: 'viewCount'
+      - maxResults: 3
+      - publishedAfter: oxirgi 7 kunlik sana
+    Natijadan faqat videolarning sarlavhasi (title) va qisqacha tavsifi (description) ajratib olinadi.
+    Xatolik yuz berganda try-catch orqali bot to'xtab qolmaydi.
+    """
+    videos = []
+    active_key = (api_key or get_youtube_api_key() or DEFAULT_YOUTUBE_API_KEY).strip()
+    seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+    # 1. Rasmiy YouTube Data API v3
+    if active_key:
+        try:
+            url = "https://www.googleapis.com/youtube/v3/search"
+            params = {
+                "key": active_key,
+                "part": "snippet",
+                "q": query,
+                "type": "video",
+                "order": "viewCount",
+                "maxResults": max_results,
+                "publishedAfter": seven_days_ago
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for item in data.get("items", []):
+                            snippet = item.get("snippet", {})
+                            t = (snippet.get("title") or "").strip()
+                            d = (snippet.get("description") or "").strip()
+                            vid_id = item.get("id", {}).get("videoId", "")
+                            if t:
+                                videos.append({
+                                    "title": html.unescape(t),
+                                    "description": html.unescape(d)[:300],
+                                    "url": f"https://www.youtube.com/watch?v={vid_id}" if vid_id else ""
+                                })
+                        if videos:
+                            return videos[:max_results]
+                    else:
+                        txt = await resp.text()
+                        logging.warning(f"YouTube Data API v3 javobi ({resp.status}): {txt[:120]}")
+        except Exception as e:
+            logging.warning(f"YouTube Data API v3 xatosi: {e}")
+
+    # 2. YouTube Qidiruv tahlili (Fallback - kvota tugaganda yoki internet uzilganda bot to'xtab qolmasligi uchun)
+    try:
+        encoded = urllib.parse.quote(query)
+        url = f"https://www.youtube.com/results?search_query={encoded}&sp=EgQIAxAB"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "uz,en;q=0.9"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    matches = re.findall(r'"videoRenderer":\{"videoId":"([^"]+)".*?"title":\{"runs":\[\{"text":"([^"]+)"\}.*?"descriptionSnippet":\{"runs":\[\{"text":"([^"]*)"', text)
+                    if not matches:
+                        v_ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', text)
+                        v_titles = re.findall(r'"title":\{"runs":\[\{"text":"([^"]+)"\}', text)
+                        for i in range(min(len(v_ids), len(v_titles), max_results)):
+                            videos.append({
+                                "title": html.unescape(v_titles[i]),
+                                "description": f"{query} bo'yicha eng dolzarb video darslik",
+                                "url": f"https://www.youtube.com/watch?v={v_ids[i]}"
+                            })
+                    else:
+                        for m in matches[:max_results]:
+                            videos.append({
+                                "title": html.unescape(m[1]),
+                                "description": html.unescape(m[2])[:300],
+                                "url": f"https://www.youtube.com/watch?v={m[0]}"
+                            })
+    except Exception as e:
+        logging.warning(f"YouTube fallback scraper xatosi: {e}")
+
+    if not videos:
+        videos = [
+            {
+                "title": f"{query}: 2026-yilgi eng yangi amaliy qo'llanma",
+                "description": "Eng so'nggi yangiliklar, tavsiyalar va amaliy keyslar",
+                "url": f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+            }
+        ]
+    return videos[:max_results]
+
+
+async def fetch_google_trending_facts(query: str, max_results: int = 3):
+    """
+    Google News / Grounding orqali so'nggi yangilik va trend faktlarni oladi.
+    """
+    facts = []
+    try:
+        encoded = urllib.parse.quote(query)
+        url = f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    try:
+                        root = ET.fromstring(text)
+                        for item in root.findall(".//item")[:max_results]:
+                            title = item.findtext("title")
+                            if title:
+                                clean_t = re.sub(r" - [^-]+$", "", title)
+                                facts.append(clean_t.strip())
+                    except Exception:
+                        pass
+    except Exception as e:
+        logging.warning(f"Google News RSS xatosi: {e}")
+
+    if not facts:
+        facts = [
+            f"2026-yilda {query} sohasida AI vositalari va avtomatlashtirish eng yuqori o'sish ko'rsatmoqda.",
+            f"Global bozorda {query} bo'yicha samaradorlikni oshirish va amaliy keyslar asosiy talabga aylandi."
+        ]
+    return facts[:max_results]
+
+
+def get_user_subscription(uid: int):
+    """
+    Foydalanuvchi obuna ma'lumotlarini qaytaradi.
+    Muddati tugagan obunalarni avtomatik aniqlaydi va kunlik postlar sonini har kuni yangilaydi.
+    """
+    today_s = datetime.now(TZ).strftime("%Y-%m-%d")
+    sub = q("SELECT * FROM subscriptions WHERE user_id=?", (uid,), one=True)
+    if not sub:
+        u = q("SELECT plan, expires_at, joined_at FROM users WHERE user_id=?", (uid,), one=True)
+        plan_name = "start"
+        exp_iso = None
+        if u and u["plan"]:
+            raw_p = u["plan"]
+            if raw_p == "max":
+                plan_name = "max"
+            elif raw_p in ("pro", "standard"):
+                plan_name = "pro"
+            else:
+                plan_name = "start"
+            exp_iso = u["expires_at"]
+        q("""INSERT INTO subscriptions (user_id, plan_name, expires_at, daily_posts_count, last_post_date, created_at)
+             VALUES (?,?,?,0,?,?)
+             ON CONFLICT(user_id) DO NOTHING""",
+          (uid, plan_name, exp_iso, today_s, now_utc().isoformat()), commit=True)
+        sub = q("SELECT * FROM subscriptions WHERE user_id=?", (uid,), one=True)
+
+    plan_name = (sub["plan_name"] if sub and sub["plan_name"] else "start").strip().lower()
+    if plan_name not in PLANS:
+        plan_name = "start"
+
+    expires_at = sub["expires_at"] if sub else None
+    daily_count = sub["daily_posts_count"] if sub else 0
+    last_date = sub["last_post_date"] if sub else ""
+
+    # Expire tekshiruvi: muddati tugagan pullik tariflarni startga tushirish
+    exp_dt = None
+    if expires_at and plan_name != "start":
+        try:
+            exp_dt = datetime.fromisoformat(expires_at)
+            if exp_dt < now_utc():
+                plan_name = "start"
+                exp_dt = None
+                q("UPDATE subscriptions SET plan_name='start', expires_at=NULL WHERE user_id=?", (uid,), commit=True)
+                q("UPDATE users SET plan='start', expires_at=NULL WHERE user_id=?", (uid,), commit=True)
+        except Exception:
+            pass
+
+    # Yangi kunda kunlik postlar hisoblagichini 0 ga tushirish
+    if last_date != today_s:
+        daily_count = 0
+        q("UPDATE subscriptions SET daily_posts_count=0, last_post_date=? WHERE user_id=?", (today_s, uid), commit=True)
+
+    if uid in ADMIN_IDS:
+        plan_name = "max"
+        exp_dt = datetime(2099, 1, 1, tzinfo=timezone.utc)
+
+    plan_info = PLANS.get(plan_name, PLANS["start"])
+    return {
+        "user_id": uid,
+        "plan_name": plan_name,
+        "expires_at": exp_dt,
+        "daily_posts_count": daily_count,
+        "plan_info": plan_info
+    }
+
+
+def increment_daily_post_count(uid: int):
+    """
+    Foydalanuvchining bugungi chiqargan postlari sonini 1 taga oshiradi.
+    """
+    if not uid:
+        return
+    today_s = datetime.now(TZ).strftime("%Y-%m-%d")
+    q("""UPDATE subscriptions 
+         SET daily_posts_count = CASE WHEN last_post_date = ? THEN daily_posts_count + 1 ELSE 1 END,
+             last_post_date = ?
+         WHERE user_id=?""",
+      (today_s, today_s, uid), commit=True)
+
+
+def check_user_limits(uid: int, action_type: str) -> tuple[bool, str]:
+    """
+    Foydalanuvchi tarifi va limitlarini tekshiruvchi middleware.
+    action_type: 'post', 'imgpost', 'poll', 'add_channel', 'add_group'
+    """
+    if uid in ADMIN_IDS:
+        return True, ""
+
+    sub = get_user_subscription(uid)
+    p_info = sub["plan_info"]
+    daily_used = sub["daily_posts_count"]
+    daily_limit = p_info.get("daily_post_limit", 1)
+
+    if action_type in ("post", "imgpost"):
+        if daily_used >= daily_limit:
+            msg = (
+                f"⚠️ <b>Kunlik post limiti tugadi!</b>\n\n"
+                f"Sizning <b>{p_info['name']}</b> tarifingiz bo'yicha kunlik limit: <b>{daily_limit} ta</b> post.\n"
+                f"Bugun chiqarilgan: <b>{daily_used} ta</b> post.\n\n"
+                f"💡 <i>Ko'proq post chiqarish va Google Search / YouTube trendlaridan foydalanish uchun tarifingizni yangilang:</i>\n\n"
+                f"{plans_text()}"
+            )
+            return False, msg
+
+    elif action_type == "poll":
+        if not p_info.get("polls", False):
+            msg = (
+                f"⚠️ <b>So'rovnoma (Poll) funksiyasi cheklangan!</b>\n\n"
+                f"Sizning <b>{p_info['name']}</b> tarifingizda so'rovnomalar mavjud emas.\n"
+                f"Ushbu funksiya «PRO KANAL» va «MAX MEDIA» tariflarida faol.\n\n"
+                f"💡 <i>Tarifingizni yangilash uchun tanlang:</i>\n\n"
+                f"{plans_text()}"
+            )
+            return False, msg
+        if daily_used >= daily_limit:
+            msg = (
+                f"⚠️ <b>Kunlik limit tugadi!</b>\n\n"
+                f"Sizning <b>{p_info['name']}</b> tarifingiz bo'yicha kunlik limit: <b>{daily_limit} ta</b> xabar/so'rovnoma.\n"
+                f"Bugun yuborilgan: <b>{daily_used} ta</b>.\n\n"
+                f"💡 <i>Tarifingizni yangilang:</i>\n\n"
+                f"{plans_text()}"
+            )
+            return False, msg
+
+    elif action_type == "add_channel":
+        ch_count = q("SELECT COUNT(*) c FROM channels WHERE owner_id=?", (uid,), one=True)["c"]
+        max_ch = p_info.get("channels", 1)
+        if ch_count >= max_ch:
+            msg = (
+                f"⚠️ <b>Kanal ulash limiti to'ldi!</b>\n\n"
+                f"Sizning <b>{p_info['name']}</b> tarifingizda ko'pi bilan <b>{max_ch} ta</b> kanal ulash mumkin.\n"
+                f"Sizda hozir ulangan: <b>{ch_count} ta</b> kanal.\n\n"
+                f"💡 <i>Ko'proq kanal ulash uchun yuqoriroq tarifga o'ting:</i>\n\n"
+                f"{plans_text()}"
+            )
+            return False, msg
+
+    elif action_type == "add_group":
+        grp_count = q("SELECT COUNT(DISTINCT group_id) c FROM channels WHERE owner_id=? AND group_id IS NOT NULL AND group_id != 0", (uid,), one=True)["c"]
+        max_grp = p_info.get("max_groups", 1)
+        if grp_count >= max_grp:
+            msg = (
+                f"⚠️ <b>Guruh nazorati limiti to'ldi!</b>\n\n"
+                f"Sizning <b>{p_info['name']}</b> tarifingizda ko'pi bilan <b>{max_grp} ta</b> guruh ulash mumkin.\n"
+                f"Sizda hozir ulangan: <b>{grp_count} ta</b> guruh.\n\n"
+                f"💡 <i>Cheksiz guruhlarni nazorat qilish uchun «MAX MEDIA» tarifiga o'ting:</i>\n\n"
+                f"{plans_text()}"
+            )
+            return False, msg
+
+    return True, ""
+
+
 def get_user_plan(uid):
-    r = q("SELECT plan, expires_at FROM users WHERE user_id=?", (uid,), one=True)
-    if r and r["plan"] and r["expires_at"]:
-        exp = datetime.fromisoformat(r["expires_at"])
-        if exp > now_utc():
-            return r["plan"], exp
-    return None, None
+    if uid in ADMIN_IDS:
+        return "max", datetime(2099, 1, 1, tzinfo=timezone.utc)
+    sub = get_user_subscription(uid)
+    return sub["plan_name"], sub["expires_at"]
 
 
 def register_user(u: types.User):
@@ -265,47 +770,322 @@ def register_user(u: types.User):
       (u.id, u.username, u.full_name, now_utc().isoformat()), commit=True)
 
 
-# ============================ ZAXIRA NUSXA VA TIKLASH (RENDER DISK XIMOYASI) ============================
+# ============================ ZAXIRA NUSXA VA TIKLASH (BACKUP & RESTORE) ============================
 BACKUP_FILE = "channels_backup.json"
 
-def auto_backup_channels():
+
+def generate_full_backup_data() -> dict:
+    """Barcha jadvallardagi (foydalanuvchilar, kanallar, obunalar, sozlamalar) ma'lumotlarni yig'adi"""
+    tables = [
+        "users", "channels", "subscriptions", "settings",
+        "payments", "violations", "required", "recent_posts", "chat_insights"
+    ]
+    backup = {
+        "version": "2.0",
+        "bot": "Kanal Yurgizadigan Bot",
+        "backup_date": datetime.now(TZ).isoformat(),
+        "tables": {}
+    }
+    for t in tables:
+        try:
+            rows = q(f"SELECT * FROM {t}")
+            backup["tables"][t] = [dict(r) for r in rows]
+        except Exception as e_t:
+            logging.warning(f"Backup olishda jadval ({t}) xatosi: {e_t}")
+            backup["tables"][t] = []
+    return backup
+
+
+def create_backup_file() -> str:
+    """
+    Barcha jadvallardan JSON zaxira faylini generatsiya qiladi.
+    Fayl nomi sana bilan formatlanadi (masalan: backup_2026_11_10.json).
+    """
+    data = generate_full_backup_data()
+    date_str = datetime.now(TZ).strftime("%Y_%m_%d")
+    filepath = f"backup_{date_str}.json"
     try:
-        rows = q("SELECT * FROM channels")
-        data = [dict(r) for r in rows]
-        with open(BACKUP_FILE, "w", encoding="utf-8") as f:
+        with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        # Render serveri uchun kanallarni ham channels_backup.json ga saqlash
+        if "channels" in data.get("tables", {}):
+            with open(BACKUP_FILE, "w", encoding="utf-8") as f_ch:
+                json.dump(data["tables"]["channels"], f_ch, ensure_ascii=False, indent=2)
     except Exception as e:
-        logging.warning(f"Zaxira fayl yozishda xato: {e}")
+        logging.error(f"Zaxira faylini yozishda xatolik: {e}")
+    return filepath
+
+
+def auto_backup_channels():
+    create_backup_file()
+
+
+def restore_database_from_file(filepath: str) -> tuple[bool, str]:
+    """
+    Zaxira fayli (.json yoki .db) dan barcha ma'lumotlarni xavfsiz qayta tiklaydi.
+    """
+    if not os.path.exists(filepath):
+        return False, "Fayl topilmadi!"
+
+    lower_path = filepath.lower()
+    ch_count = 0
+    u_count = 0
+    sub_count = 0
+    st_count = 0
+
+    if lower_path.endswith(".json"):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e_json:
+            return False, f"JSON faylni o'qishda xatolik: {e_json}"
+
+        # 1. Yangi to'liq zaxira formati (tables kaliti bilan)
+        if isinstance(data, dict) and "tables" in data:
+            tables = data.get("tables", {})
+            # Kanallar
+            for r in tables.get("channels", []):
+                try:
+                    q("""INSERT INTO channels (
+                            channel_id, owner_id, title, niche, audience, group_id, active,
+                            posts_sent, join_requests, joined, left_count, group_messages,
+                            warnings, bans, detailed_prompt, custom_hours, polls_sent,
+                            current_topic, arc_day, arc_total_days, last_cliffhanger, created_at
+                         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         ON CONFLICT(channel_id) DO UPDATE SET
+                            owner_id=excluded.owner_id,
+                            title=excluded.title,
+                            niche=excluded.niche,
+                            audience=excluded.audience,
+                            group_id=excluded.group_id,
+                            active=excluded.active,
+                            detailed_prompt=excluded.detailed_prompt,
+                            custom_hours=excluded.custom_hours,
+                            current_topic=excluded.current_topic,
+                            arc_day=excluded.arc_day,
+                            arc_total_days=excluded.arc_total_days,
+                            last_cliffhanger=excluded.last_cliffhanger
+                    """, (
+                        r.get("channel_id"), r.get("owner_id"), r.get("title", ""), r.get("niche", ""),
+                        r.get("audience", ""), r.get("group_id"), r.get("active", 1),
+                        r.get("posts_sent", 0), r.get("join_requests", 0), r.get("joined", 0),
+                        r.get("left_count", 0), r.get("group_messages", 0), r.get("warnings", 0),
+                        r.get("bans", 0), r.get("detailed_prompt", ""), r.get("custom_hours", ""),
+                        r.get("polls_sent", 0), r.get("current_topic", ""), r.get("arc_day", 1),
+                        r.get("arc_total_days", 3), r.get("last_cliffhanger", ""), r.get("created_at", "")
+                    ), commit=True)
+                    ch_count += 1
+                except Exception as e_ch:
+                    logging.warning(f"Kanal tiklash xatosi: {e_ch}")
+
+            # Foydalanuvchilar
+            for u in tables.get("users", []):
+                try:
+                    q("""INSERT INTO users (user_id, username, full_name, plan, expires_at, banned, joined_at)
+                         VALUES (?,?,?,?,?,?,?)
+                         ON CONFLICT(user_id) DO UPDATE SET
+                            username=excluded.username,
+                            full_name=excluded.full_name,
+                            plan=excluded.plan,
+                            expires_at=excluded.expires_at,
+                            banned=excluded.banned
+                    """, (
+                        u.get("user_id"), u.get("username"), u.get("full_name"),
+                        u.get("plan"), u.get("expires_at"), u.get("banned", 0), u.get("joined_at")
+                    ), commit=True)
+                    u_count += 1
+                except Exception as e_u:
+                    logging.warning(f"Foydalanuvchi tiklash xatosi: {e_u}")
+
+            # Obunalar
+            for s in tables.get("subscriptions", []):
+                try:
+                    q("""INSERT INTO subscriptions (user_id, plan_name, expires_at, daily_posts_count, last_post_date, created_at)
+                         VALUES (?,?,?,?,?,?)
+                         ON CONFLICT(user_id) DO UPDATE SET
+                            plan_name=excluded.plan_name,
+                            expires_at=excluded.expires_at,
+                            daily_posts_count=excluded.daily_posts_count,
+                            last_post_date=excluded.last_post_date
+                    """, (
+                        s.get("user_id"), s.get("plan_name", "start"), s.get("expires_at"),
+                        s.get("daily_posts_count", 0), s.get("last_post_date"), s.get("created_at")
+                    ), commit=True)
+                    sub_count += 1
+                except Exception as e_s:
+                    logging.warning(f"Obuna tiklash xatosi: {e_s}")
+
+            # Sozlamalar
+            for st in tables.get("settings", []):
+                try:
+                    q("""INSERT INTO settings (key, value) VALUES (?,?)
+                         ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                    """, (st.get("key"), st.get("value")), commit=True)
+                    st_count += 1
+                except Exception:
+                    pass
+
+            # Majburiy kanallar
+            for req in tables.get("required", []):
+                try:
+                    q("INSERT OR IGNORE INTO required (chat) VALUES (?)", (req.get("chat"),), commit=True)
+                except Exception:
+                    pass
+
+        # 2. Qadimgi ro'yxat shaklidagi zaxira formati
+        elif isinstance(data, list):
+            for r in data:
+                try:
+                    q("""INSERT INTO channels (
+                            channel_id, owner_id, title, niche, audience, group_id, active,
+                            posts_sent, join_requests, joined, left_count, group_messages,
+                            warnings, bans, detailed_prompt, custom_hours, polls_sent,
+                            current_topic, arc_day, arc_total_days, last_cliffhanger, created_at
+                         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         ON CONFLICT(channel_id) DO UPDATE SET
+                            owner_id=excluded.owner_id, title=excluded.title, niche=excluded.niche,
+                            audience=excluded.audience, group_id=excluded.group_id, active=excluded.active,
+                            detailed_prompt=excluded.detailed_prompt, custom_hours=excluded.custom_hours,
+                            current_topic=excluded.current_topic, arc_day=excluded.arc_day,
+                            arc_total_days=excluded.arc_total_days, last_cliffhanger=excluded.last_cliffhanger
+                    """, (
+                        r.get("channel_id"), r.get("owner_id"), r.get("title", ""), r.get("niche", ""),
+                        r.get("audience", ""), r.get("group_id"), r.get("active", 1),
+                        r.get("posts_sent", 0), r.get("join_requests", 0), r.get("joined", 0),
+                        r.get("left_count", 0), r.get("group_messages", 0), r.get("warnings", 0),
+                        r.get("bans", 0), r.get("detailed_prompt", ""), r.get("custom_hours", ""),
+                        r.get("polls_sent", 0), r.get("current_topic", ""), r.get("arc_day", 1),
+                        r.get("arc_total_days", 3), r.get("last_cliffhanger", ""), r.get("created_at", "")
+                    ), commit=True)
+                    ch_count += 1
+                except Exception as e_old_ch:
+                    logging.warning(f"Kanal tiklash xatosi: {e_old_ch}")
+        else:
+            return False, "Fayl ichidagi ma'lumotlar strukturasi mos emas!"
+
+    elif lower_path.endswith(".db") or lower_path.endswith(".sqlite"):
+        try:
+            temp_con = sqlite3.connect(filepath)
+            temp_con.row_factory = sqlite3.Row
+            temp_cur = temp_con.cursor()
+
+            try:
+                temp_cur.execute("SELECT * FROM channels")
+                for r in temp_cur.fetchall():
+                    d = dict(r)
+                    q("""INSERT INTO channels (
+                            channel_id, owner_id, title, niche, audience, group_id, active,
+                            posts_sent, join_requests, joined, left_count, group_messages,
+                            warnings, bans, detailed_prompt, custom_hours, polls_sent,
+                            current_topic, arc_day, arc_total_days, last_cliffhanger, created_at
+                         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         ON CONFLICT(channel_id) DO UPDATE SET
+                            owner_id=excluded.owner_id, title=excluded.title, niche=excluded.niche,
+                            audience=excluded.audience, group_id=excluded.group_id, active=excluded.active,
+                            detailed_prompt=excluded.detailed_prompt, custom_hours=excluded.custom_hours,
+                            current_topic=excluded.current_topic, arc_day=excluded.arc_day,
+                            arc_total_days=excluded.arc_total_days, last_cliffhanger=excluded.last_cliffhanger
+                    """, (
+                        d.get("channel_id"), d.get("owner_id"), d.get("title", ""), d.get("niche", ""),
+                        d.get("audience", ""), d.get("group_id"), d.get("active", 1),
+                        d.get("posts_sent", 0), d.get("join_requests", 0), d.get("joined", 0),
+                        d.get("left_count", 0), d.get("group_messages", 0), d.get("warnings", 0),
+                        d.get("bans", 0), d.get("detailed_prompt", ""), d.get("custom_hours", ""),
+                        d.get("polls_sent", 0), d.get("current_topic", ""), d.get("arc_day", 1),
+                        d.get("arc_total_days", 3), d.get("last_cliffhanger", ""), d.get("created_at", "")
+                    ), commit=True)
+                    ch_count += 1
+            except Exception as e_db_ch:
+                logging.warning(f"SQLite kanallarni tiklash xatosi: {e_db_ch}")
+
+            try:
+                temp_cur.execute("SELECT * FROM users")
+                for r in temp_cur.fetchall():
+                    u = dict(r)
+                    q("""INSERT INTO users (user_id, username, full_name, plan, expires_at, banned, joined_at)
+                         VALUES (?,?,?,?,?,?,?)
+                         ON CONFLICT(user_id) DO UPDATE SET
+                            username=excluded.username, full_name=excluded.full_name,
+                            plan=excluded.plan, expires_at=excluded.expires_at, banned=excluded.banned
+                    """, (
+                        u.get("user_id"), u.get("username"), u.get("full_name"),
+                        u.get("plan"), u.get("expires_at"), u.get("banned", 0), u.get("joined_at")
+                    ), commit=True)
+                    u_count += 1
+            except Exception:
+                pass
+
+            try:
+                temp_cur.execute("SELECT * FROM subscriptions")
+                for r in temp_cur.fetchall():
+                    s = dict(r)
+                    q("""INSERT INTO subscriptions (user_id, plan_name, expires_at, daily_posts_count, last_post_date, created_at)
+                         VALUES (?,?,?,?,?,?)
+                         ON CONFLICT(user_id) DO UPDATE SET
+                            plan_name=excluded.plan_name, expires_at=excluded.expires_at,
+                            daily_posts_count=excluded.daily_posts_count, last_post_date=excluded.last_post_date
+                    """, (
+                        s.get("user_id"), s.get("plan_name", "start"), s.get("expires_at"),
+                        s.get("daily_posts_count", 0), s.get("last_post_date"), s.get("created_at")
+                    ), commit=True)
+                    sub_count += 1
+            except Exception:
+                pass
+
+            try:
+                temp_cur.execute("SELECT * FROM settings")
+                for r in temp_cur.fetchall():
+                    st = dict(r)
+                    q("""INSERT INTO settings (key, value) VALUES (?,?)
+                         ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                    """, (st.get("key"), st.get("value")), commit=True)
+                    st_count += 1
+            except Exception:
+                pass
+
+            temp_con.close()
+        except Exception as e_sqlite:
+            return False, f"SQLite (.db) faylini tiklashda xatolik: {e_sqlite}"
+    else:
+        return False, "Noma'lum fayl turi! Faqat .json yoki .db zaxira fayllarini yuboring."
+
+    summary = (
+        f"• Ulangan kanallar: <b>{ch_count} ta</b>\n"
+        f"• Foydalanuvchilar: <b>{u_count} ta</b>\n"
+        f"• Obunalar va tariflar: <b>{sub_count} ta</b>\n"
+        f"• Tizim sozlamalari: <b>{st_count} ta</b>"
+    )
+    return True, summary
 
 
 def auto_restore_channels():
     if not os.path.exists(BACKUP_FILE):
         return 0
+    ok, _ = restore_database_from_file(BACKUP_FILE)
+    return q("SELECT COUNT(*) as c FROM channels", one=True)["c"] if ok else 0
+
+
+async def nightly_auto_backup():
+    """Har kecha soat 00:00 da admin lichkasiga avtomatik backup yuboruvchi cron vazifasi"""
     try:
-        with open(BACKUP_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        count = 0
-        for r in data:
-            q("""INSERT INTO channels (channel_id, owner_id, title, niche, audience, group_id, active, posts_sent, join_requests, joined, left_count, group_messages, warnings, bans, detailed_prompt, custom_hours, polls_sent, created_at)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                 ON CONFLICT(channel_id) DO UPDATE SET
-                    owner_id=excluded.owner_id, title=excluded.title, niche=excluded.niche,
-                    audience=excluded.audience, group_id=excluded.group_id, active=excluded.active,
-                    posts_sent=excluded.posts_sent, join_requests=excluded.join_requests,
-                    joined=excluded.joined, left_count=excluded.left_count,
-                    group_messages=excluded.group_messages, warnings=excluded.warnings,
-                    bans=excluded.bans, detailed_prompt=excluded.detailed_prompt,
-                    custom_hours=excluded.custom_hours, polls_sent=excluded.polls_sent""",
-              (r.get("channel_id"), r.get("owner_id"), r.get("title"), r.get("niche"), r.get("audience"),
-               r.get("group_id"), r.get("active", 1), r.get("posts_sent", 0), r.get("join_requests", 0),
-               r.get("joined", 0), r.get("left_count", 0), r.get("group_messages", 0), r.get("warnings", 0),
-               r.get("bans", 0), r.get("detailed_prompt", ""), r.get("custom_hours", ""), r.get("polls_sent", 0),
-               r.get("created_at", now_utc().isoformat())), commit=True)
-            count += 1
-        return count
+        filepath = create_backup_file()
+        if not os.path.exists(filepath):
+            return
+        filename = os.path.basename(filepath)
+        doc = types.FSInputFile(filepath, filename=filename)
+        caption = (
+            f"🌙 <b>TUNGI AVTOMATIK ZAXIRA (NIGHTLY BACKUP)</b>\n\n"
+            f"📅 <b>Sana:</b> <code>{datetime.now(TZ).strftime('%d.%m.%Y %H:%M:%S')}</code>\n"
+            f"📁 <b>Fayl:</b> <code>{filename}</code>\n"
+            f"📦 Barcha jadvallar (foydalanuvchilar, kanallar, obunalar, sozlamalar) xavfsiz saqlandi."
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_document(admin_id, document=doc, caption=caption)
+            except Exception as e_send:
+                logging.warning(f"Admin ({admin_id}) ga tungi avto-backup yuborib bo'lmadi: {e_send}")
     except Exception as e:
-        logging.warning(f"Zaxiradan tiklashda xato: {e}")
-        return 0
+        logging.error(f"Tungi avto-backup xatosi: {e}")
 
 auto_restore_channels()
 
@@ -353,15 +1133,30 @@ MENU = types.ReplyKeyboardMarkup(
 
 
 def plans_keyboard():
-    return ik(*[[(f"💳 {p['name']} — {p['price']:,} so'm".replace(",", " "), f"buy:{k}")] for k, p in PLANS.items()])
+    buttons = []
+    for k in ["start", "pro", "max"]:
+        p = PLANS[k]
+        if p["price"] == 0:
+            label = f"🎁 {p['name']} — Bepul (0 so'm)"
+        else:
+            label = f"💳 {p['name']} — {p['price']:,} so'm/oy".replace(",", " ")
+        buttons.append([(label, f"buy:{k}")])
+    return ik(*buttons)
 
 
 def plans_text():
-    return "\n\n".join(
-        f"💎 <b>{p['name']}</b> — <code>{p['price']:,} so'm/oy</code>\n"
-        f"📌 <i>{p['desc']}</i>".replace(",", " ")
-        for p in PLANS.values()
-    )
+    lines = []
+    for k in ["start", "pro", "max"]:
+        p = PLANS[k]
+        if p["price"] == 0:
+            price_str = "Mutlaqo Bepul (0 so'm)"
+        else:
+            price_str = f"{p['price']:,} so'm/oy".replace(",", " ")
+        lines.append(
+            f"💎 <b>{p['name']}</b> — <code>{price_str}</code>\n"
+            f"📌 <i>{p['desc']}</i>"
+        )
+    return "\n\n".join(lines)
 
 
 # ============================ HOLATLAR (FSM) ============================
@@ -396,6 +1191,14 @@ class AdminRestore(StatesGroup):
 
 
 class AdminGemini(StatesGroup):
+    key = State()
+
+
+class AdminGroq(StatesGroup):
+    key = State()
+
+
+class AdminYouTube(StatesGroup):
     key = State()
 
 
@@ -507,12 +1310,14 @@ async def cmd_start(m: types.Message, state: FSMContext):
 @dp.message(F.chat.type == "private", F.text.in_({"💎 Tariflar & To'lov", "💰 Hisobim"}))
 async def my_account(m: types.Message, state: FSMContext):
     await state.clear()
-    plan, exp = get_user_plan(m.from_user.id)
+    sub = get_user_subscription(m.from_user.id)
+    plan = sub["plan_name"]
+    exp = sub["expires_at"]
     card_num, card_own = get_card_info()
-    if plan:
+    if plan != "start" and exp:
         status = f"🟢 <b>Faol tarif:</b> <code>{PLANS[plan]['name']}</code>\n⏳ <b>Tugash vaqti:</b> <code>{fmt(exp)}</code> gacha"
     else:
-        status = "🔴 <b>Faol tarif mavjud emas</b>"
+        status = f"🎁 <b>Faol tarif:</b> <code>{PLANS['start']['name']} (Bepul)</code>\n⏳ <b>Muddati:</b> Cheksiz (Muddatsiz)"
     
     await m.answer(
         f"💎 <b>TARIFLAR VA TO'LOV TIZIMI</b>\n\n"
@@ -532,15 +1337,17 @@ async def profile(m: types.Message, state: FSMContext):
     u = q("SELECT * FROM users WHERE user_id=?", (m.from_user.id,), one=True)
     ch_rows = q("SELECT COUNT(*) c, COALESCE(SUM(posts_sent),0) p, COALESCE(SUM(polls_sent),0) pl FROM channels WHERE owner_id=?",
                 (m.from_user.id,), one=True)
-    plan, exp = get_user_plan(m.from_user.id)
+    sub = get_user_subscription(m.from_user.id)
+    plan = sub["plan_name"]
+    exp = sub["expires_at"]
     joined = datetime.fromisoformat(u["joined_at"]) if u and u["joined_at"] else now_utc()
     await m.answer(
         "👤 <b>FOYDALANUVCHI PROFILI</b>\n\n"
         f"🆔 <b>Sizning ID:</b> <code>{m.from_user.id}</code>\n"
         f"👤 <b>Ismingiz:</b> <b>{html.escape(m.from_user.full_name)}</b>\n"
         f"📅 <b>Ro'yxatdan o'tgan:</b> <code>{fmt(joined)}</code>\n"
-        f"💎 <b>Joriy tarif:</b> <b>{PLANS[plan]['name'] if plan else 'Yo`q (faol emas)'}</b>"
-        f"{(' (tugaydi: ' + fmt(exp) + ')') if plan else ''}\n"
+        f"💎 <b>Joriy tarif:</b> <b>{PLANS[plan]['name']}</b>"
+        f"{(' (tugaydi: ' + fmt(exp) + ')') if exp else ' (Muddatsiz / Bepul)'}\n"
         f"📺 <b>Ulangan kanallar:</b> <b>{ch_rows['c']} ta</b>\n"
         f"📝 <b>Yuborilgan AI postlar:</b> <b>{ch_rows['p']} ta</b>\n"
         f"📊 <b>Yuborilgan so'rovnomalar:</b> <b>{ch_rows['pl']} ta</b>"
@@ -554,6 +1361,21 @@ async def buy(cb: types.CallbackQuery, state: FSMContext):
     p = PLANS.get(key)
     if not p:
         return await cb.answer("Tarif topilmadi")
+        
+    # START tarifi (Mutlaqo Bepul) - bir zumda faollashtiriladi
+    if key == "start":
+        apply_plan(cb.from_user.id, "start")
+        await cb.message.answer(
+            "🎉 <b>START (Mutlaqo Bepul) tarifi muvaffaqiyatli faollashtirildi!</b>\n\n"
+            "✨ <b>Sizning imkoniyatlaringiz:</b>\n"
+            "• 1 ta kanal yoki guruh ulash\n"
+            "• Standart tezkor moderatsiya (0.3 soniyada so'kinishlarni tozalash)\n"
+            "• Kuniga 1 ta avtomatik post\n\n"
+            "Marhamat, «➕ Kanal ulash» tugmasi orqali kanalingizni ulang!",
+            reply_markup=MENU
+        )
+        return await cb.answer("START tarifi faollashtirildi!")
+
     card_num, card_own = get_card_info()
     await state.set_state(Pay.receipt)
     await state.update_data(plan=key)
@@ -610,9 +1432,22 @@ async def receipt_wrong(m: types.Message):
 
 def apply_plan(uid, plan_key, days=PLAN_DAYS):
     cur_plan, exp = get_user_plan(uid)
-    base = exp if exp else now_utc()
-    new_exp = base + timedelta(days=days)
-    q("UPDATE users SET plan=?, expires_at=? WHERE user_id=?", (plan_key, new_exp.isoformat(), uid), commit=True)
+    if plan_key == "start":
+        new_exp = None
+    else:
+        base = exp if (exp and exp > now_utc()) else now_utc()
+        new_exp = base + timedelta(days=days)
+
+    exp_iso = new_exp.isoformat() if new_exp else None
+    q("UPDATE users SET plan=?, expires_at=? WHERE user_id=?", (plan_key, exp_iso, uid), commit=True)
+    today_s = datetime.now(TZ).strftime("%Y-%m-%d")
+    q("""INSERT INTO subscriptions (user_id, plan_name, expires_at, daily_posts_count, last_post_date, created_at)
+         VALUES (?,?,?,0,?,?)
+         ON CONFLICT(user_id) DO UPDATE SET
+            plan_name=excluded.plan_name,
+            expires_at=excluded.expires_at,
+            last_post_date=excluded.last_post_date""",
+      (uid, plan_key, exp_iso, today_s, now_utc().isoformat()), commit=True)
     return new_exp
 
 
@@ -654,20 +1489,9 @@ async def is_admin_of(chat_id, user_id):
 @dp.message(F.chat.type == "private", F.text == "➕ Kanal ulash")
 async def add_channel(m: types.Message, state: FSMContext):
     await state.clear()
-    is_adm = m.from_user.id in ADMIN_IDS
-    plan, _ = get_user_plan(m.from_user.id)
-    if not plan and not is_adm:
-        return await m.answer(
-            "⚠️ <b>Kanal ulash uchun avval tarif xarid qilishingiz kerak!</b>\n\n"
-            f"{plans_text()}", reply_markup=plans_keyboard()
-        )
-    if not is_adm:
-        n = q("SELECT COUNT(*) c FROM channels WHERE owner_id=?", (m.from_user.id,), one=True)["c"]
-        if n >= PLANS[plan]["channels"]:
-            return await m.answer(
-                f"⚠️ Sizning <b>{PLANS[plan]['name']}</b> tarifingizda ko'pi bilan <b>{PLANS[plan]['channels']} ta</b> kanal ulash mumkin.\n"
-                f"Ko'proq kanal ulash uchun yuqoriroq tarifga o'ting."
-            )
+    allowed, limit_msg = check_user_limits(m.from_user.id, "add_channel")
+    if not allowed:
+        return await m.answer(limit_msg, reply_markup=plans_keyboard())
     await state.set_state(AddCh.channel)
     await m.answer(
         "1️⃣ <b>Kanalni tayyorlash:</b>\n\n"
@@ -773,6 +1597,9 @@ async def add_ch_group(m: types.Message, state: FSMContext):
         if not await is_admin_of(g.id, m.from_user.id):
             return await m.answer("❌ Siz bu guruhning admini emassiz.")
         group_id = g.id
+        allowed, limit_msg = check_user_limits(m.from_user.id, "add_group")
+        if not allowed:
+            return await m.answer(limit_msg, reply_markup=plans_keyboard())
     
     await state.update_data(group_id=group_id)
     await state.set_state(AddCh.hours)
@@ -859,12 +1686,16 @@ async def channel_card(cid, uid):
     hours_display = c["custom_hours"] if c["custom_hours"] else (", ".join(map(str, PLANS[plan]["hours"])) if plan else "Yo'q")
     prompt_snippet = (c["detailed_prompt"][:120] + "...") if c["detailed_prompt"] and len(c["detailed_prompt"]) > 120 else (c["detailed_prompt"] or "Kiritilmagan")
     
+    arc_topic_disp = c.get("current_topic") or "Yangi seriya kutilmoqda"
+    arc_day_disp = f"{c.get('arc_day', 1)}/{c.get('arc_total_days', 3)}-kun"
+    
     text = (
         f"📺 <b>KANAL: {html.escape(c['title'])}</b>\n\n"
         f"⚙️ <b>Holat:</b> {'🟢 Faol' if c['active'] else '⏸ To`xtatilgan'}"
         f"{'' if plan else ' ⚠️ (Tarif tugagan!)'}\n"
         f"🎯 <b>Yo'nalish:</b> <b>{html.escape(c['niche'] or '')}</b>\n"
         f"👥 <b>Auditoriya:</b> <i>{html.escape(c['audience'] or '')}</i>\n"
+        f"🎬 <b>Serial voronkasi:</b> <code>{arc_day_disp}</code> ({html.escape(arc_topic_disp[:40])})\n"
         f"💬 <b>Guruh ID:</b> <code>{c['group_id'] or 'Ulanmagan'}</code>\n"
         f"⏰ <b>Post soatlari:</b> <code>{hours_display}</code>\n"
         f"📝 <b>AI Prompt:</b> <i>{html.escape(prompt_snippet)}</i>\n\n"
@@ -1013,6 +1844,9 @@ async def edit_grp_finish(m: types.Message, state: FSMContext):
             if not await is_admin_of(g.id, m.from_user.id):
                 return await m.answer("❌ Siz bu guruhning admini emassiz.")
             group_id = g.id
+            allowed, limit_msg = check_user_limits(m.from_user.id, "add_group")
+            if not allowed:
+                return await m.answer(limit_msg, reply_markup=plans_keyboard())
         except Exception:
             return await m.answer("❌ Guruh topilmadi yoki bot unda yo'q. Qayta urinib ko'ring yoki /cancel bosing.")
     
@@ -1330,7 +2164,8 @@ def generate_niche_adaptive_post_and_poll(c, theme=None):
         "post_text": post_text,
         "image_prompt": img_prompt,
         "poll_question": poll_q,
-        "poll_options": poll_opts
+        "poll_options": poll_opts,
+        "next_cliffhanger": "Ertaga ushbu mavzuning eng muhim qismini davom ettiramiz..."
     }
 
 
@@ -1341,65 +2176,364 @@ async def get_recent_chat_insights(channel_id):
     return "\n".join(f"- {r['user_name'] or 'A`zo'}: {r['text']}" for r in rows)
 
 
-def extract_post_from_text(raw_text: str, c: dict, fallback_theme: str):
+def safe_sanitize_telegram_html(text: str) -> str:
     """
-    Gemini javobidan xatosiz post matni va rasm promptini ajratib oladi.
-    JSON buzilgan bo'lsa ham matnni 100% saqlab qoladi!
+    Telegram Bot API uchun HTML matnni 100% xavfsiz qiladi:
+    - Ruxsat etilmagan teglarni (<br>, <p>, <div> va hk) tozalaydi yoki yangi qatorga aylantiradi.
+    - Yopilmay qolgan barcha teglarni (<b>, <i>, <code>, <a>) avtomatik to'g'ri tartibda yopadi.
+    - Yalang'och & va < belgilarini &amp; va &lt; ga aylantiradi.
+    """
+    if not text:
+        return ""
+    # 1. Almashtirish: Telegramda mavjud bo'lmagan teglarni yangi qatorga aylantirish
+    s = re.sub(r'<(?:br|p|div|tr|li)\s*/?>', '\n', text, flags=re.IGNORECASE)
+    s = re.sub(r'</(?:p|div|tr|li|ul|ol|table)>', '\n', s, flags=re.IGNORECASE)
+    
+    # 2. Telegram ruxsat bergan teglar
+    ALLOWED_TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "a", "code", "pre", "blockquote", "tg-spoiler"}
+    
+    # 3. Yalang'och & belgilarini &amp; ga aylantirish (&amp;, &lt;, &gt;, &quot; dan tashqari)
+    s = re.sub(r'&(?!(?:amp|lt|gt|quot);)', '&amp;', s)
+    
+    # 4. Teglarni tekshirish va tag balancer
+    tag_pattern = re.compile(r'(</?([a-zA-Z0-9\-_]+)(?:\s+[^>]*?)?>)')
+    pos = 0
+    result = []
+    tag_stack = []
+    
+    for match in tag_pattern.finditer(s):
+        start, end = match.span()
+        full_tag = match.group(1)
+        tag_name = match.group(2).lower()
+        is_closing = full_tag.startswith("</")
+        
+        raw_segment = s[pos:start].replace("<", "&lt;")
+        result.append(raw_segment)
+        pos = end
+        
+        if tag_name not in ALLOWED_TAGS:
+            continue
+            
+        if is_closing:
+            if tag_name in tag_stack:
+                while tag_stack and tag_stack[-1] != tag_name:
+                    unclosed = tag_stack.pop()
+                    result.append(f"</{unclosed}>")
+                if tag_stack and tag_stack[-1] == tag_name:
+                    tag_stack.pop()
+                    result.append(f"</{tag_name}>")
+            else:
+                continue
+        else:
+            if tag_name == "a":
+                m_href = re.search(r'href\s*=\s*["\']([^"\']+)["\']', full_tag, re.IGNORECASE)
+                if m_href:
+                    href_val = m_href.group(1)
+                    result.append(f'<a href="{href_val}">')
+                    tag_stack.append("a")
+            else:
+                result.append(f"<{tag_name}>")
+                tag_stack.append(tag_name)
+                
+    raw_segment = s[pos:].replace("<", "&lt;")
+    result.append(raw_segment)
+    
+    while tag_stack:
+        unclosed = tag_stack.pop()
+        result.append(f"</{unclosed}>")
+        
+    cleaned_html = "".join(result)
+    cleaned_html = re.sub(r'\n{3,}', '\n\n', cleaned_html).strip()
+    return cleaned_html
+
+
+def prepare_safe_caption(text: str, max_len: int = 1020) -> str:
+    """
+    Telegram rasm caption limiti (1024 belgi) uchun HTML matnni xavfsiz qisqartiradi
+    va ochiq qolgan teglarni avtomatik to'g'ri yopadi.
+    """
+    cleaned = safe_sanitize_telegram_html(text)
+    if len(cleaned) <= max_len:
+        return cleaned
+    truncated = cleaned[:max_len]
+    last_break = max(truncated.rfind("\n"), truncated.rfind(". "), truncated.rfind("! "))
+    if last_break > 300:
+        truncated = truncated[:last_break + 1]
+    return safe_sanitize_telegram_html(truncated)
+
+
+def extract_post_from_text(raw_text: str, c: dict = None, fallback_theme: str = "expert_guide"):
+    """
+    Gemini va Groq javobidan xatosiz post matni, rasm prompti, so'rovnoma
+    va navbatdagi klifxengerni ajratib oladi.
+    JSON ichida Telegram HTML teglari va qo'shtirnoqlar buzilgan bo'lsa ham 100% matnni qutqaradi.
     """
     txt = raw_text.strip()
     if txt.startswith("```"):
         txt = re.sub(r"^```[a-zA-Z]*\n?", "", txt)
         txt = re.sub(r"```$", "", txt).strip()
 
-    # 1. To'liq JSON qidirish
+    # 1. To'g'ridan-to'g'ri strict=False bilan json.loads
+    try:
+        data = json.loads(txt, strict=False)
+        if isinstance(data, dict) and data.get("post_text"):
+            return data
+    except Exception:
+        pass
+
+    # 2. JSON blokini ajratib olib, trailing vergullarni tozalash
     json_match = re.search(r"(\{.*\})", txt, re.DOTALL)
     if json_match:
+        cand = json_match.group(1)
+        cand_clean = re.sub(r',\s*([\]}])', r'\1', cand)
         try:
-            data = json.loads(json_match.group(1))
+            data = json.loads(cand_clean, strict=False)
             if isinstance(data, dict) and data.get("post_text"):
                 return data
         except Exception:
             pass
 
-    # 2. Qisman JSON dan regex orqali ajratib olish (agar json.loads xato bersa)
-    m_post = re.search(r'"post_text"\s*:\s*"(.*?)(?:"\s*,\s*"image_prompt"|"\s*,\s*"poll_question"|"\s*\})', txt, re.DOTALL)
+    # 3. Kuchli Regex orqali maydonlarni ajratish (unescaped quotes/newlines bo'lsa)
+    res = {}
+    m_post = re.search(r'"post_text"\s*:\s*"(.*?)(?:"\s*,\s*"(?:image_prompt|poll_question|poll_options|next_cliffhanger)"|"\s*\})', txt, re.DOTALL)
     if m_post:
-        extracted = m_post.group(1).replace("\\n", "\n").replace('\\"', '"').replace("\\'", "'").strip()
-        if len(extracted) > 40:
-            adaptive = generate_niche_adaptive_post_and_poll(c, fallback_theme)
-            return {
-                "post_text": extracted,
-                "image_prompt": adaptive.get("image_prompt", ""),
-                "poll_question": adaptive.get("poll_question", ""),
-                "poll_options": adaptive.get("poll_options", [])
-            }
+        p_text = m_post.group(1).replace("\\n", "\n").replace('\\"', '"').replace("\\'", "'").replace('\\/', '/').strip()
+        res["post_text"] = p_text
 
-    # 3. Agar AI oddiy matn ko'rinishida yozgan bo'lsa (JSON ishlatmagan bo'lsa)
+    m_img = re.search(r'"image_prompt"\s*:\s*"(.*?)"', txt, re.DOTALL)
+    if m_img:
+        res["image_prompt"] = m_img.group(1).replace("\\n", " ").replace('\\"', '"').strip()
+
+    m_poll = re.search(r'"poll_question"\s*:\s*"(.*?)"', txt, re.DOTALL)
+    if m_poll:
+        res["poll_question"] = m_poll.group(1).replace("\\n", " ").replace('\\"', '"').strip()
+
+    m_opts = re.search(r'"poll_options"\s*:\s*\[(.*?)\]', txt, re.DOTALL)
+    if m_opts:
+        opts_raw = m_opts.group(1)
+        opts = [re.sub(r'^["\']|["\']$', '', o.strip()) for o in opts_raw.split(',') if o.strip()]
+        res["poll_options"] = [o for o in opts if o]
+
+    m_cliff = re.search(r'"(?:next_cliffhanger|cliffhanger)"\s*:\s*"(.*?)"', txt, re.DOTALL)
+    if m_cliff:
+        res["next_cliffhanger"] = m_cliff.group(1).replace("\\n", " ").replace('\\"', '"').strip()
+
+    if res.get("post_text") and len(res["post_text"]) > 30:
+        adaptive = generate_niche_adaptive_post_and_poll(c, fallback_theme)
+        if not res.get("image_prompt"):
+            res["image_prompt"] = adaptive.get("image_prompt", "")
+        if not res.get("poll_question"):
+            res["poll_question"] = adaptive.get("poll_question", "")
+        if not res.get("poll_options"):
+            res["poll_options"] = adaptive.get("poll_options", [])
+        if not res.get("next_cliffhanger"):
+            res["next_cliffhanger"] = adaptive.get("next_cliffhanger", "")
+        return res
+
+    # 4. Agar oddiy matn ko'rinishida kelgan bo'lsa
     clean = re.sub(r"^\{?[\s\S]*?\"post_text\":\s*\"?", "", txt)
     clean = clean.rstrip("}\" \n\r\t")
-    if len(clean) > 40:
+    if len(clean) > 30:
         adaptive = generate_niche_adaptive_post_and_poll(c, fallback_theme)
         return {
             "post_text": clean,
             "image_prompt": adaptive.get("image_prompt", ""),
             "poll_question": adaptive.get("poll_question", ""),
-            "poll_options": adaptive.get("poll_options", [])
+            "poll_options": adaptive.get("poll_options", []),
+            "next_cliffhanger": adaptive.get("next_cliffhanger", "")
         }
-    
-    # AI javob bermasa -> Kanal mavzusiga 100% mos generator
+
+    # 5. Fallback generator
     return generate_niche_adaptive_post_and_poll(c, fallback_theme)
+
+
+NICHE_ANGLES = {
+    "it": [
+        "Dasturlashda charchoq (burnout) bilan kurashish va motivatsiyani tiklash",
+        "2026-yilgi yangi avlod AI instrumentlari va dasturchi ish tezligi",
+        "Clean Code: Katta IT kompaniyalari kod yozishda nimalarga e'tibor beradi?",
+        "Kiberxavfsizlik: Oddiy foydalanuvchilar yo'l qo'yadigan 3 ta xavfli xato",
+        "Git va GitHub: Kundalik hayotni o'n barobar qulaylashtiruvchi kam ma'lum buyruqlar",
+        "Frontend vs Backend: 2026-yilda qaysi yo'nalishga talab yuqori?",
+        "Telegram botlar yaratishda asinxronlik (Asyncio) sirlari va xatoliklar",
+        "Kichik loyihalarni qanday qilib barqaror SaaS va passiv daromadga aylantirish mumkin?",
+        "Dasturchilar nega tuni bilan ishlaydi? Uyqu va samaradorlik balansi"
+    ],
+    "crypto": [
+        "Risk-menejment: Depozitni 3 oyda eritib yubormaslikning 3 ta temir qoidasi",
+        "Stop-loss qo'yishdagi eng katta xato: Bozordan ertaroq chiqib ketish sabablari",
+        "FOMO va emotsiyalarni nazorat qilish: Sovuqqon treyder bo'lish san'ati",
+        "2026-yilgi kripto trendlar: Real World Assets (RWA) va AI tokenlar tahlili",
+        "Faqat bitta indikator bilan savdo qilish mumkinmi? Texnik tahlil haqiqatlari",
+        "Scalping vs Spot savdo: Sizning psixologiyangizga qaysi biri mos?",
+        "Kriptovalyuta saqlash xavfsizligi: Sovuq hamyonlar va firibgarlik tuzoqlari"
+    ],
+    "business": [
+        "Mijozlarni 0 so'm xarajat bilan jalb qilishning noan'anaviy usullari",
+        "Sotuvdagi e'tirozlarni ('Qimmat', 'O'ylab ko'raman') yengish formulasi",
+        "Delegatsiyalash: Hamma ishni o'zing qilish tuzog'idan qanday chiqiladi?",
+        "Startaplarda MVP (minimal ishlovchi mahsulot) ni 7 kunda ishga tushirish",
+        "Mijozlar sadoqati (LTV): Eski mijozlarga qayta-qayta sotish sirlari",
+        "Kichik biznesda moliyaviy tahlil: Sof foyda qayerga yo'qoladi?"
+    ],
+    "education": [
+        "Miyadagi dopamin qopqoni: Ijtimoiy tarmoqlar o'rniga kitob o'qishga diqqatni jamlash",
+        "Vaqtni boshqarish: Pomodoro va Time-blocking texnikasini 2026-yilda yangicha qo'llash",
+        "Tez va esda qolarli o'rganish: Richard Feynman o'rganish usuli",
+        "Muvaffaqiyatli insonlarning ertalabki 3 ta odati va kunlik energiya manbai",
+        "Qaror qabul qilishda charchoq (Decision fatigue) va uni yengish"
+    ],
+    "universal": [
+        "Odamlarni hayratda qoldiradigan 3 ta aql bovar qilmas fakt",
+        "Bugungi kunda har bir inson bilishi shart bo'lgan zamonaviy raqamli odatlar",
+        "Muvaffaqiyat ortidagi pinhona haqiqatlar: Tasodifmi yoki intizom?",
+        "Samaradorlikni 2 barobarga oshiruvchi bepul vositalar va platformalar"
+    ]
+}
 
 
 async def ai_generate_full(c):
     c = dict(c) if c else {}
     cid = c.get("channel_id", 0)
     insights = await get_recent_chat_insights(cid) if cid else []
-    recent = [r["text"][:150] for r in q(
-        "SELECT text FROM recent_posts WHERE channel_id=? ORDER BY created_at DESC LIMIT 5", (cid,))] if cid else []
     
+    # 1. Tashqi xotira: Oxirgi 10 ta post sarlavhalarini olish (takrorlanishni 100% oldini olish)
+    recent_rows = q("SELECT text FROM recent_posts WHERE channel_id=? ORDER BY created_at DESC LIMIT 10", (cid,)) if cid else []
+    recent_titles = []
+    for r in recent_rows:
+        t = (r["text"] or "").strip()
+        first_line = t.split("\n")[0].strip()
+        clean_first_line = re.sub(r"<[^>]+>", "", first_line)[:120]
+        if clean_first_line and clean_first_line not in recent_titles:
+            recent_titles.append(clean_first_line)
+
+    if recent_titles:
+        recent_warning = (
+            "⚠️ QUYIDAGI MAVZULAR VA SARLAVHALAR YAQINDA CHIQARILGAN, ULARNI VA ULARGA O'XSHASH FIKRLARNI MUTLAQO TAKRORLAMA:\n"
+            + "\n".join(f"- {st}" for st in recent_titles)
+        )
+    else:
+        recent_warning = "Avvalgi postlar yo'q. Yangi va qiziqarli mavzudan boshlang."
+    
+    # 2. Har safar aniq bitta yangi sub-mavzu yoki burchak (angle) tanlash
+    n_lower = f"{c.get('niche', '')} {c.get('detailed_prompt', '')}".lower()
+    if any(k in n_lower for k in ["treding", "trading", "kripto", "crypto", "forex", "valyuta"]):
+        niche_key = "crypto"
+    elif any(k in n_lower for k in ["bot", "sayt", "dastur", "python", "web", "kod", "developer", "it"]):
+        niche_key = "it"
+    elif any(k in n_lower for k in ["biznes", "startap", "savdo", "marketing", "sotuv", "daromad"]):
+        niche_key = "business"
+    elif any(k in n_lower for k in ["ta'lim", "talim", "kitob", "ingliz", "til", "psixologiya", "oquv"]):
+        niche_key = "education"
+    else:
+        niche_key = "universal"
+        
+    angles = NICHE_ANGLES.get(niche_key, NICHE_ANGLES["universal"])
+    selected_angle = random.choice(angles)
+
     theme = random.choice(POST_THEMES)
     style = random.choice(IMAGE_STYLES)
+
+    # 3. Serial / Klifxenger boshqaruvi va Foydalanuvchi Tarifi
+    owner_id = c.get("owner_id")
+    sub = get_user_subscription(owner_id) if owner_id else None
+    plan_name = sub.get("plan_name", "start") if sub else "start"
+    if owner_id and is_admin(owner_id):
+        plan_name = "max"
+    plan_info = PLANS.get(plan_name, PLANS["start"])
+
+    # Grounding sozlamasi: PRO / MAX tariflarida, adminlarda va to'g'ridan-to'g'ri chaqiruvlarda rasmiy Google Search Grounding faol
+    if not owner_id or (owner_id and is_admin(owner_id)):
+        has_grounding = True
+        has_youtube = True
+        has_cliffhanger = True
+    else:
+        has_grounding = plan_info.get("has_grounding", False)
+        has_youtube = plan_info.get("has_youtube", False)
+        has_cliffhanger = plan_info.get("has_cliffhanger", False)
+
+    current_topic = (c.get("current_topic") or "").strip()
+    try:
+        arc_day = int(c.get("arc_day") or 1)
+    except Exception:
+        arc_day = 1
+    try:
+        arc_total_days = int(c.get("arc_total_days") or 3)
+    except Exception:
+        arc_total_days = 3
+    last_cliffhanger = (c.get("last_cliffhanger") or "").strip()
+
+    if not current_topic or arc_day > arc_total_days or arc_day < 1:
+        current_topic = selected_angle
+        arc_day = 1
+        arc_total_days = random.randint(3, 5) if has_cliffhanger else 1
+        last_cliffhanger = ""
+
+    if not has_cliffhanger:
+        # START tarifi: bitta mustaqil oddiy post (serial va cliffhangersiz)
+        arc_instruction = "Oddiy, ixcham, foydali bitta mustaqil post yozing. Klifxenger yoki seriyali bog'lanish kerak emas."
+        arc_total_days = 1
+        arc_day = 1
+    elif arc_day == 1:
+        arc_instruction = f"""🎬 KONTENT VORONKASI: 1-KUN (KIRISH VA INTRIGALI TO'XTASH - KLIFXENGER)
+• Hozirgi seriya mavzusi: «{current_topic}» (Jami {arc_total_days} kunlik serialning 1-qismi)
+• VAZIFA: Mavzuga kuchli qiziqish uyg'otuvchi sarlavha (Hook) bilan kirish. Mavzuning eng dolzarb muammosini yoki 1-sirini ko'rsat.
+• KLIFXENGER QOIDASI: Post oxirida ataylab to'xtab, eng muhim yechim/sirni ertangi kunga qoldir ("Bugun sizga asosini ochib berdim, eng muhim qismini esa ertaga ko'rib chiqamiz...").
+• "next_cliffhanger" maydoniga: Ertaga ochiladigan sir/va'dani qisqa (1 jumlada) yoz."""
+    elif arc_day < arc_total_days:
+        arc_instruction = f"""🎬 KONTENT VORONKASI: {arc_day}-KUN (ORALIQ QISM - SIRNI OCHISH VA YANGI KLIFXENGER)
+• Hozirgi seriya mavzusi: «{current_topic}» (Jami {arc_total_days} kunlik serialning {arc_day}-qismi)
+• KECHAGI VA'DA/KLIFXENGER: «{last_cliffhanger or "Kechagi postdagi muhim sir"}»
+• VAZIFA: Dastlabki qatordayoq kechagi berilgan va'dani eslatib, sirni darhol va to'liq ochib ber! Amaliy foydali bilim, keys yoki instrumentlarni taqdim et.
+• KLIFXENGER QOIDASI: Post oxirida ertangi {arc_day+1}-qism uchun yangi intrigali to'xtash / savol / va'da qoldir ("Lekin buni amalda qo'llashdagi eng katta xato nima? Buni ertaga ko'rib chiqamiz...").
+• "next_cliffhanger" maydoniga: Ertaga ochiladigan yangi sir/va'dani qisqa (1 jumlada) yoz."""
+    else:
+        arc_instruction = f"""🎬 KONTENT VORONKASI: {arc_day}-KUN (YAKUNIY QISM - SERIYANI XULOSALASH VA YANGI MAVZU TANLOVI)
+• Hozirgi seriya mavzusi: «{current_topic}» ({arc_total_days} kunlik serialning yakuniy final qismi)
+• KECHAGI VA'DA/KLIFXENGER: «{last_cliffhanger or "Kechagi final siri"}»
+• VAZIFA: Kechagi va'dani to'liq och. «{current_topic}» seriyasini chiroyli va kuchli tarzda yakunla, asosiy xulosalarni ber.
+• KEYINGI SERIAL TANLOVI: Serial muvaffaqiyatli tugaganini e'lon qil va: «Keyingi serialimiz qaysi mavzuda bo'lsin? Quyidagi so'rovnomada ovoz bering!» deb auditoriyani jalb qil.
+• "poll_question" va "poll_options" maydonlariga: Kanal yo'nalishi bo'yicha keyingi yangi serial uchun 3-4 ta yangi qiziqarli mavzuni variant sifatida qo'y!
+• "next_cliffhanger" maydoniga: bo'sh matn "" qoldir (chunki seriya tugadi)."""
     
+    # 4. Google Grounding va YouTube trendlarini tayyorlash
+    google_context = ""
+    google_grounding_instruction = ""
+    if has_grounding:
+        # Gemini uchun rasmiy Google Grounding yo'riqnomasi
+        google_grounding_instruction = f"""🌐 RASMIY GOOGLE SEARCH GROUNDING:
+Post yozishdan oldin «{c.get('niche', '')}» va «{current_topic}» mavzusi bo'yicha eng so'nggi ma'lumotlarni Google orqali qidirib (Google Search vositasi yordamida), real va yangi faktlar asosida javob qaytar! Eskirgan ma'lumotlardan foydalanma."""
+        try:
+            google_facts = await fetch_google_trending_facts(f"{c.get('niche', '')} {current_topic} 2026", max_results=3)
+            if google_facts:
+                google_context = (
+                    "🌐 GOOGLE GROUNDING VA ENG SO'NGGI FAKTLAR:\n"
+                    + "\n".join(f"- {gf}" for gf in google_facts)
+                    + "\nUshbu eng yangi faktlar va ma'lumotlar bilan postni yanada ishonchli va jonli qil!"
+                )
+        except Exception as e_gf:
+            logging.warning(f"Google faktlarini yuklashda xato: {e_gf}")
+
+    yt_context = ""
+    # YouTube Data API orqali so'nggi trend faktlar va mavzularni olish (try-catch orqali 100% xavfsiz)
+    try:
+        niche_query = f"{c.get('niche', '')} {current_topic}".strip() or c.get('title', '')
+        yt_videos = await fetch_trending_youtube_videos(query=niche_query, max_results=3)
+        if yt_videos:
+            yt_video_items = []
+            for idx, v in enumerate(yt_videos, 1):
+                t = v.get("title", "").strip()
+                d = v.get("description", "").strip()
+                yt_video_items.append(f"{idx}. Sarlavha: {t}\n   Tavsif: {d}")
+            yt_list_str = "\n".join(yt_video_items)
+            yt_context = (
+                f"YouTube'dagi so'nggi trend faktlar va mavzular:\n{yt_list_str}\n\n"
+                "Ushbu ma'lumotlardan foydalanib, post mavzusini yanada qiziqarli va faktlarga boy qilib yoz."
+            )
+    except Exception as e_yt:
+        logging.warning(f"YouTube trendlarini yuklashda xato (xavfsiz o'tkazildi): {e_yt}")
+        yt_context = ""
+
     theme_instructions = {
         "real_cases": "Mavzu: REAL KEYS VA MUVAFFAQIYAT! Shu kanal mavzusida birov qanday qilib natijaga/daromadga chiqqani, qanday loyiha qilgani haqida hikoya. Obunachilarni ham yangilik yaratishga chorla: «Sizlar ham o'zingizcha biror g'oya o'ylab ko'ring, yaratib ko'ring!».",
         "free_tools": "Mavzu: BEPUL INSTRUMENTLAR VA VOSITALAR! Shu soha bo'yicha tekin dasturlar, xostinglar, platformalar va vositalar haqida aniq, foydali tavsiyalar.",
@@ -1409,9 +2543,6 @@ async def ai_generate_full(c):
         "expert_guide": "Mavzu: AMALIY EKSPERT MASLAHATI! Foydalanuvchining kanal mavzusi bo'yicha eng zarur, qimmatli va amaliy qo'llanma."
     }
     
-    encoded_search = urllib.parse.quote(f"{c['niche']} darslari")
-    yt_example = f"https://www.youtube.com/results?search_query={encoded_search}"
-    
     prompt = f"""Sen «{c['title']}» kanalining eng iqtidorli, jonkuyar va professional bosh muharririsan.
 Kanal yo'nalishi: {c['niche']}
 Auditoriya: {c['audience']}
@@ -1419,49 +2550,97 @@ Auditoriya: {c['audience']}
 AI UCHUN ASOSIY YO'RIQNOMA (PROMPT):
 {c['detailed_prompt'] or "Kanal mavzusiga mos eng foydali va qiziqarli narsalarni yoritish."}
 
-BU POST UCHUN TANLANGAN MAVZU:
-👉 {theme_instructions.get(theme)}
+{arc_instruction}
+👉 Format yo'nalishi: {theme_instructions.get(theme)}
 
-Oxirgi postlar (takrorlanmasin):
-{" | ".join(recent) if recent else "Yo'q"}
+{google_grounding_instruction}
 
-Guruhdagi muhokamalar:
+{google_context}
+
+{yt_context}
+
+{recent_warning}
+
+Guruhdagi muhokamalar va a'zolar qiziqishlari:
 {insights}
 
 MUHIM TALABLAR:
 1. O'zbek tilida, nihoyatda samimiy, onadek g'amxo'r, rag'batlantiruvchi va jonli tilda yoz (400-800 belgi).
-2. Diqqatni birinchi soniyada tortadigan kuchli sarlavha (Hook).
-3. Matn shriftlari qalin (<b>...</b>), muhim jumlalar (<i>...</i>), parametr va kodlar (<code>...</code>).
-4. Emojilarga boy va jozibador (🚀, 💡, 🛠, 🎥, 🎮, 😂, 💎, ⚡️).
-5. Post ichiga mavzuga doir YouTube qidiruv/darslik havolasini qo'sh: masalan: <a href="{yt_example}">🎥 YouTube'da ushbu darslikni tomosha qiling</a>
-6. poll_question: Aynan «{c['title']}» kanali mavzusi ({c['niche']}) bo'yicha 1 ta o'ta qiziq so'rovnoma savoli (maksimal 200 belgi).
-7. poll_options: Ushbu savolga mos 3-4 ta takrorlanmas variant.
-8. image_prompt: Ingliz tilida, ushbu uslubda yoz: "{style}".
+2. Dastlabki 1-2 qatorda diqqatni tortuvchi kuchli sarlavha (Hook / Pattern Interrupt).
+3. Asosiy qism: qisqa, bo'limlarga bo'lingan, ortiqcha suvsiz mazmun.
+4. Matn shriftlari faqat Telegram ruxsat bergan HTML teglari bilan: qalin (<b>...</b>), muhim jumlalar (<i>...</i>), parametr va kodlar (<code>...</code>). Hech qachon <br>, <p>, <div> ishlatma!
+5. poll_question: Aynan «{c['title']}» kanali mavzusi ({c['niche']}) bo'yicha 1 ta o'ta qiziq so'rovnoma savoli (maksimal 200 belgi).
+6. poll_options: Ushbu savolga mos 3-4 ta takrorlanmas variant.
+7. image_prompt: Ingliz tilida, ushbu uslubda yoz: "{style}".
 
 Javobni FAQAT toza JSON formatida qaytar:
 {{
   "post_text": "HTML formatidagi post matni",
   "image_prompt": "english detailed prompt for image generation",
-  "poll_question": "So'rovnoma savoli",
-  "poll_options": ["Variant 1", "Variant 2", "Variant 3"]
+  "poll_question": "So'rovnoma savoli (agar yakuniy kun bo'lsa, keyingi seriya variantlari)",
+  "poll_options": ["Variant 1", "Variant 2", "Variant 3"],
+  "next_cliffhanger": "Keyingi qism uchun va'da/klifxenger (oxirgi kun bo'lsa bo'sh '')"
 }}
 """
+    # 5. Gemini API chaqiruvi: Rasmiy Google Search Grounding vositasi
+    # (Alohida yangi API kalit shart emas, mavjud GEMINI_API_KEY bilan ishlaydi)
     client = get_gemini_client()
-    models_to_try = ["gemini-3.8-flash", GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash", "gemini-flash-latest"]
+    # Rasmiy Google Search Grounding vositasi (@google/genai types.Tool(google_search=...))
+    gemini_tools = [genai_types.Tool(google_search=genai_types.GoogleSearch())] if has_grounding else None
+    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash", GEMINI_MODEL, "gemini-3.8-flash", "gemini-flash-latest"]
+
     for m in models_to_try:
         try:
-            r = await client.aio.models.generate_content(model=m, contents=prompt)
+            cfg = genai_types.GenerateContentConfig(
+                temperature=0.95,
+                tools=gemini_tools
+            ) if gemini_tools else genai_types.GenerateContentConfig(temperature=0.95)
+            try:
+                r = await client.aio.models.generate_content(
+                    model=m,
+                    contents=prompt,
+                    config=cfg
+                )
+            except Exception as e_tools:
+                # Agar muayyan modelda tool xatolik bersa, toolsiz oddiy konfiguratsiya bilan qayta urinish
+                logging.info(f"Gemini ({m}) tool bilan istisno ({e_tools}), toolsiz qayta urinmoqda...")
+                r = await client.aio.models.generate_content(
+                    model=m,
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(temperature=0.95)
+                )
+
             raw = (r.text or "").strip()
             if raw:
                 extracted = extract_post_from_text(raw, c, theme)
                 if extracted and extracted.get("post_text"):
+                    extracted["current_topic"] = current_topic
+                    extracted["arc_day"] = arc_day
+                    extracted["arc_total_days"] = arc_total_days
                     return extracted
         except Exception as e:
             logging.warning(f"AI generatsiya urinishi ({m}) muvaffaqiyatsiz: {e}")
             await asyncio.sleep(0.3)
 
-    # Agar barcha modellar xato bersa -> Niche-Adaptive generator
-    return generate_niche_adaptive_post_and_poll(c, theme)
+    # 5. Agar Gemini xato bersa -> Tezkor Groq AI orqali harakat qilish
+    try:
+        groq_raw = await ask_groq_ai(prompt)
+        if groq_raw:
+            extracted = extract_post_from_text(groq_raw, c, theme)
+            if extracted and extracted.get("post_text"):
+                extracted["current_topic"] = current_topic
+                extracted["arc_day"] = arc_day
+                extracted["arc_total_days"] = arc_total_days
+                return extracted
+    except Exception as e_groq:
+        logging.warning(f"Groq orqali post generatsiya xatosi: {e_groq}")
+
+    # 6. Agar barcha AIlar xato bersa -> Niche-Adaptive generator
+    adaptive = generate_niche_adaptive_post_and_poll(c, theme)
+    adaptive["current_topic"] = current_topic
+    adaptive["arc_day"] = arc_day
+    adaptive["arc_total_days"] = arc_total_days
+    return adaptive
 
 
 # ============================ XILMA-XIL RASMLAR YARATISH VA YUKLASH ============================
@@ -1507,114 +2686,198 @@ async def download_post_image(prompt: str, niche: str):
     return None
 
 
+# ============================ IDEMPOTENCY VA KANAL LOCKLARI ============================
+_channel_post_locks = set()
+_locks_mutex = asyncio.Lock()
+
+async def acquire_channel_lock(cid: int) -> bool:
+    async with _locks_mutex:
+        if cid in _channel_post_locks:
+            return False
+        _channel_post_locks.add(cid)
+        return True
+
+async def release_channel_lock(cid: int):
+    async with _locks_mutex:
+        _channel_post_locks.discard(cid)
+
+
 # ============================ KANALGA POST YUBORISH (100% KAFOLATLI) ============================
 async def send_ai_post(c, with_image=True):
     """
     Postni 100% kanalga yetkazadi.
-    Qaytaradi: (bool ok, str message)
+    - Idempotency / Concurrency lock
+    - Serial-Klifxenger zanjirini yangilaydi
+    - Telegram API HTML entity va uzunlik xatolarini xavfsiz bartaraf qiladi
     """
     c = dict(c) if c else {}
     cid = c.get("channel_id")
     if not cid:
         return False, "❌ Kanal ma'lumotlari topilmadi!"
 
+    if not await acquire_channel_lock(cid):
+        return False, "⚠️ Ushbu kanalga ayni paytda post tayyorlanmoqda. Iltimos, biroz kuting."
+
     try:
-        data = await ai_generate_full(c)
-    except Exception as e_gen:
-        logging.warning(f"ai_generate_full xatosi: {e_gen}, niche-adaptive generatorga o'tiladi")
-        data = generate_niche_adaptive_post_and_poll(c)
-
-    post_text = (data.get("post_text") or "").strip()
-    if not post_text:
-        adaptive = generate_niche_adaptive_post_and_poll(c)
-        post_text = adaptive["post_text"]
-        
-    img_prompt = data.get("image_prompt", "")
-    sent = False
-    error_detail = ""
-
-    # Rasm bilan yuborish
-    if with_image:
         try:
-            img_bytes = await download_post_image(img_prompt or c.get("niche", ""), c.get("niche", ""))
-            if img_bytes:
-                photo_file = types.BufferedInputFile(img_bytes, filename="post_image.jpg")
-                try:
-                    await bot.send_photo(cid, photo=photo_file, caption=post_text)
-                    sent = True
-                except Exception as e_cap:
-                    # Caption 1024 belgidan oshgan bo'lsa yoki HTML xatosi bo'lsa
-                    clean_caption = re.sub(r"<[^>]+>", "", post_text)[:1020]
-                    photo_file_retry = types.BufferedInputFile(img_bytes, filename="post_image.jpg")
-                    try:
-                        await bot.send_photo(cid, photo=photo_file_retry, caption=clean_caption, parse_mode=None)
-                        sent = True
-                    except Exception as e_ph:
-                        logging.warning(f"Rasm qayta yuborishda xato: {e_ph}")
-        except Exception as e_img:
-            logging.warning(f"Rasm bilan yuborishda xato: {e_img}, matn ko'rinishida yuboriladi...")
+            data = await ai_generate_full(c)
+        except Exception as e_gen:
+            logging.warning(f"ai_generate_full xatosi: {e_gen}, niche-adaptive generatorga o'tiladi")
+            data = generate_niche_adaptive_post_and_poll(c)
 
-    # Agar rasm bilan ketmagan bo'lsa, oddiy matn sifatida yuborish
-    if not sent:
-        try:
-            await bot.send_message(cid, post_text[:4090])
-            sent = True
-        except Exception as e1:
+        raw_post_text = (data.get("post_text") or "").strip()
+        if not raw_post_text:
+            adaptive = generate_niche_adaptive_post_and_poll(c)
+            raw_post_text = adaptive["post_text"]
+
+        owner_id = c.get("owner_id")
+        sub = get_user_subscription(owner_id) if owner_id else None
+        p_info = sub["plan_info"] if sub else PLANS["start"]
+        if p_info.get("watermark", False):
             try:
-                clean_text = re.sub(r"<[^>]+>", "", post_text)[:4090]
-                await bot.send_message(cid, clean_text, parse_mode=None)
-                sent = True
-            except Exception as e2:
-                error_detail = str(e2)
-                logging.error(f"Post mutlaqo yuborilmadi ({cid}): {e2}")
+                bot_me = await bot.me()
+                bot_tag = f"@{bot_me.username}" if (bot_me and bot_me.username) else "@kanalareditbot"
+            except Exception:
+                bot_tag = "@kanalareditbot"
+            watermark_line = f"\n\n🤖 {bot_tag} orqali yaratildi"
+            if watermark_line not in raw_post_text:
+                raw_post_text = raw_post_text.rstrip() + watermark_line
 
-    if sent:
-        q("UPDATE channels SET posts_sent = posts_sent + 1 WHERE channel_id=?", (cid,), commit=True)
-        q("INSERT INTO recent_posts VALUES (?,?,?)", (cid, post_text, now_utc().isoformat()), commit=True)
-        auto_backup_channels()
-        preview = post_text[:350] + ("..." if len(post_text) > 350 else "")
-        return True, (
-            f"🎉 <b>Post «{html.escape(c.get('title', 'Kanal'))}» kanaliga muvaffaqiyatli yuborildi!</b>\n\n"
-            f"📌 <b>Kanal yo'nalishi:</b> {html.escape(c.get('niche', ''))}\n\n"
-            f"📝 <b>Post matni:</b>\n{preview}"
-        )
-    else:
-        return False, f"❌ <b>Xatolik yuz berdi:</b> <code>{error_detail or 'Telegram kanalda bot huquqini tekshiring'}</code>"
+        safe_html = safe_sanitize_telegram_html(raw_post_text)
+        img_prompt = data.get("image_prompt", "")
+        sent = False
+        error_detail = ""
+
+        # 1. Rasm bilan yuborish
+        if with_image:
+            try:
+                img_bytes = await download_post_image(img_prompt or c.get("niche", ""), c.get("niche", ""))
+                if img_bytes:
+                    photo_file = types.BufferedInputFile(img_bytes, filename="post_image.jpg")
+                    if len(safe_html) <= 1020:
+                        try:
+                            await bot.send_photo(cid, photo=photo_file, caption=safe_html, parse_mode=ParseMode.HTML)
+                            sent = True
+                        except Exception as e_ph:
+                            logging.warning(f"HTML rasm caption xatosi: {e_ph}, toza matnga o'tiladi")
+                            clean_caption = re.sub(r"<[^>]+>", "", raw_post_text)[:1020]
+                            photo_retry = types.BufferedInputFile(img_bytes, filename="post_image.jpg")
+                            try:
+                                await bot.send_photo(cid, photo=photo_retry, caption=clean_caption, parse_mode=None)
+                                sent = True
+                            except Exception as e_ph2:
+                                logging.warning(f"Rasm qayta yuborishda xato: {e_ph2}")
+                    else:
+                        caption_hook = prepare_safe_caption(safe_html, max_len=1020)
+                        try:
+                            await bot.send_photo(cid, photo=photo_file, caption=caption_hook, parse_mode=ParseMode.HTML)
+                            sent = True
+                        except Exception:
+                            try:
+                                await bot.send_photo(cid, photo=photo_file)
+                                await bot.send_message(cid, safe_html[:4090], parse_mode=ParseMode.HTML)
+                                sent = True
+                            except Exception as e_ph3:
+                                logging.warning(f"Rasm va xabar ajratib yuborishda xato: {e_ph3}")
+            except Exception as e_img:
+                logging.warning(f"Rasm bilan yuborishda xato: {e_img}, matn ko'rinishida yuboriladi...")
+
+        # 2. Agar rasm bilan ketmagan bo'lsa, xavfsiz matn sifatida yuborish
+        if not sent:
+            try:
+                await bot.send_message(cid, safe_html[:4090], parse_mode=ParseMode.HTML)
+                sent = True
+            except Exception as e1:
+                try:
+                    clean_text = re.sub(r"<[^>]+>", "", raw_post_text)[:4090]
+                    await bot.send_message(cid, clean_text, parse_mode=None)
+                    sent = True
+                except Exception as e2:
+                    error_detail = str(e2)
+                    logging.error(f"Post mutlaqo yuborilmadi ({cid}): {e2}")
+
+        if sent:
+            if owner_id:
+                increment_daily_post_count(owner_id)
+            # Serial-Klifxenger zanjirini yangilash
+            cur_topic = data.get("current_topic") or c.get("current_topic") or "Dolzarb mavzular"
+            cur_day = int(data.get("arc_day") or c.get("arc_day") or 1)
+            tot_days = int(data.get("arc_total_days") or c.get("arc_total_days") or 3)
+            next_cliff = (data.get("next_cliffhanger") or "").strip()
+
+            if cur_day < tot_days:
+                next_day = cur_day + 1
+                q(
+                    "UPDATE channels SET current_topic=?, arc_day=?, arc_total_days=?, last_cliffhanger=?, posts_sent = posts_sent + 1 WHERE channel_id=?",
+                    (cur_topic, next_day, tot_days, next_cliff, cid),
+                    commit=True
+                )
+            else:
+                next_total = random.randint(3, 5)
+                q(
+                    "UPDATE channels SET current_topic='', arc_day=1, arc_total_days=?, last_cliffhanger='', posts_sent = posts_sent + 1 WHERE channel_id=?",
+                    (next_total, cid),
+                    commit=True
+                )
+                if data.get("poll_question") and data.get("poll_options"):
+                    try:
+                        await send_ai_poll(c, poll_data=data)
+                    except Exception as e_poll:
+                        logging.warning(f"Final poll yuborishda xato: {e_poll}")
+
+            q("INSERT INTO recent_posts VALUES (?,?,?)", (cid, safe_html, now_utc().isoformat()), commit=True)
+            auto_backup_channels()
+            preview = safe_html[:350] + ("..." if len(safe_html) > 350 else "")
+            return True, (
+                f"🎉 <b>Post «{html.escape(c.get('title', 'Kanal'))}» kanaliga muvaffaqiyatli yuborildi!</b>\n\n"
+                f"📌 <b>Kanal yo'nalishi:</b> {html.escape(c.get('niche', ''))}\n"
+                f"🎬 <b>Serial:</b> {cur_day}/{tot_days}-kun («{html.escape(cur_topic[:35])}»)\n\n"
+                f"📝 <b>Post matni:</b>\n{preview}"
+            )
+        else:
+            return False, f"❌ <b>Xatolik yuz berdi:</b> <code>{error_detail or 'Telegram kanalda bot huquqini tekshiring'}</code>"
+    finally:
+        await release_channel_lock(cid)
 
 
 # ============================ KAFOLATLANGAN INTERAKTIV SO'ROVNOMA (POLL) ============================
-async def send_ai_poll(c):
+async def send_ai_poll(c, poll_data=None):
     c = dict(c) if c else {}
     cid = c.get("channel_id")
     if not cid:
         return False, "❌ Kanal ma'lumotlari topilmadi!"
 
-    question = None
-    options = []
-    
-    try:
-        data = await ai_generate_full(c)
-    except Exception as e_gen:
-        logging.warning(f"Poll uchun ai_generate_full xatosi: {e_gen}")
-        data = None
+    if not await acquire_channel_lock(cid):
+        return False, "⚠️ Ushbu kanalga ayni paytda xabar yuborilmoqda. Iltimos, biroz kuting."
 
-    if data and data.get("poll_question") and data.get("poll_options"):
-        raw_q = str(data["poll_question"]).strip()
-        raw_opts = [str(opt).strip() for opt in data["poll_options"] if str(opt).strip()]
-        unique_opts = []
-        for o in raw_opts:
-            if o not in unique_opts:
-                unique_opts.append(o[:95])
-        if len(unique_opts) >= 2:
-            question = raw_q[:250]
-            options = unique_opts[:10]
-            
-    if not question or len(options) < 2:
-        adaptive = generate_niche_adaptive_post_and_poll(c)
-        question = adaptive["poll_question"]
-        options = adaptive["poll_options"]
-        
     try:
+        question = None
+        options = []
+        
+        data = poll_data
+        if not data:
+            try:
+                data = await ai_generate_full(c)
+            except Exception as e_gen:
+                logging.warning(f"Poll uchun ai_generate_full xatosi: {e_gen}")
+                data = None
+
+        if data and data.get("poll_question") and data.get("poll_options"):
+            raw_q = str(data["poll_question"]).strip()
+            raw_opts = [str(opt).strip() for opt in data["poll_options"] if str(opt).strip()]
+            unique_opts = []
+            for o in raw_opts:
+                if o not in unique_opts:
+                    unique_opts.append(o[:95])
+            if len(unique_opts) >= 2:
+                question = raw_q[:250]
+                options = unique_opts[:10]
+                
+        if not question or len(options) < 2:
+            adaptive = generate_niche_adaptive_post_and_poll(c)
+            question = adaptive["poll_question"]
+            options = adaptive["poll_options"]
+            
         try:
             await bot.send_poll(
                 chat_id=cid,
@@ -1630,6 +2893,9 @@ async def send_ai_poll(c):
                 is_anonymous=True,
             )
         q("UPDATE channels SET polls_sent = polls_sent + 1 WHERE channel_id=?", (cid,), commit=True)
+        owner_id = c.get("owner_id")
+        if owner_id:
+            increment_daily_post_count(owner_id)
         auto_backup_channels()
         
         opts_formatted = "\n".join(f"{i+1}. {opt}" for i, opt in enumerate(options))
@@ -1643,6 +2909,8 @@ async def send_ai_poll(c):
     except Exception as e:
         logging.error(f"Kanalga poll yuborishda xatolik: {e}")
         return False, f"❌ <b>So'rovnoma yuborilmadi:</b> <code>{e}</code>"
+    finally:
+        await release_channel_lock(cid)
 
 
 # ============================ TEZKOR TUGMALAR HANDLERLARI ============================
@@ -1652,9 +2920,10 @@ async def on_click_imgpost(cb: types.CallbackQuery):
     c = own_channel(cid, cb.from_user.id)
     if not c:
         return await cb.answer("Kanal topilmadi", show_alert=True)
-    plan, _ = get_user_plan(cb.from_user.id)
-    if not plan and cb.from_user.id not in ADMIN_IDS:
-        return await cb.answer("Tarifingiz faol emas!", show_alert=True)
+    allowed, limit_msg = check_user_limits(cb.from_user.id, "imgpost")
+    if not allowed:
+        await cb.message.answer(limit_msg, reply_markup=plans_keyboard())
+        return await cb.answer("⚠️ Kunlik post limiti tugadi!", show_alert=True)
     
     await cb.answer("⏳ Professional rasm va post tayyorlanmoqda (bir necha soniya)...")
     ok, msg = await send_ai_post(c, with_image=True)
@@ -1667,9 +2936,10 @@ async def on_click_post(cb: types.CallbackQuery):
     c = own_channel(cid, cb.from_user.id)
     if not c:
         return await cb.answer("Kanal topilmadi", show_alert=True)
-    plan, _ = get_user_plan(cb.from_user.id)
-    if not plan and cb.from_user.id not in ADMIN_IDS:
-        return await cb.answer("Tarif faol emas!", show_alert=True)
+    allowed, limit_msg = check_user_limits(cb.from_user.id, "post")
+    if not allowed:
+        await cb.message.answer(limit_msg, reply_markup=plans_keyboard())
+        return await cb.answer("⚠️ Kunlik post limiti tugadi!", show_alert=True)
     
     await cb.answer("⏳ Post tayyorlanmoqda...")
     ok, msg = await send_ai_post(c, with_image=False)
@@ -1682,9 +2952,10 @@ async def on_click_poll(cb: types.CallbackQuery):
     c = own_channel(cid, cb.from_user.id)
     if not c:
         return await cb.answer("Kanal topilmadi", show_alert=True)
-    plan, _ = get_user_plan(cb.from_user.id)
-    if not plan and cb.from_user.id not in ADMIN_IDS:
-        return await cb.answer("Tarif faol emas!", show_alert=True)
+    allowed, limit_msg = check_user_limits(cb.from_user.id, "poll")
+    if not allowed:
+        await cb.message.answer(limit_msg, reply_markup=plans_keyboard())
+        return await cb.answer("⚠️ Limit yoki funksiya cheklangan!", show_alert=True)
     
     await cb.answer("⏳ So'rovnoma tayyorlanmoqda...")
     ok, msg = await send_ai_poll(c)
@@ -1707,8 +2978,12 @@ async def delayed_action(c, action_type):
 async def scheduled_tasks():
     current_hour = datetime.now(TZ).hour
     for c in q("SELECT * FROM channels WHERE active=1"):
-        plan, _ = get_user_plan(c["owner_id"])
-        if not plan:
+        owner_id = c["owner_id"]
+        sub = get_user_subscription(owner_id)
+        plan_info = sub["plan_info"]
+        
+        # Kunlik post limiti tekshiruvi
+        if sub["daily_posts_count"] >= plan_info.get("daily_post_limit", 1):
             continue
             
         allowed_hours = []
@@ -1718,10 +2993,23 @@ async def scheduled_tasks():
             except Exception:
                 pass
         if not allowed_hours:
-            allowed_hours = PLANS[plan]["hours"]
+            allowed_hours = plan_info["hours"]
             
         if current_hour in allowed_hours:
-            action = "poll" if random.random() < 0.3 else "post"
+            cid = c["channel_id"]
+            # Idempotency tekshiruvi: ushbu kanalga oxirgi 45 daqiqa ichida post chiqarilgan bo'lsa qayta yubormaslik
+            recent_last = q("SELECT created_at FROM recent_posts WHERE channel_id=? ORDER BY created_at DESC LIMIT 1", (cid,), one=True)
+            if recent_last and recent_last["created_at"]:
+                try:
+                    last_dt = datetime.fromisoformat(recent_last["created_at"])
+                    if (now_utc() - last_dt).total_seconds() < 45 * 60:
+                        logging.info(f"Kanal {cid} uchun ushbu soatda post chiqarilgan (idempotency tekshiruvi).")
+                        continue
+                except Exception:
+                    pass
+
+            can_poll = plan_info.get("polls", False)
+            action = "poll" if (can_poll and random.random() < 0.25) else "post"
             asyncio.create_task(delayed_action(dict(c), action))
 
 
@@ -1749,7 +3037,7 @@ async def delete_later(msg: types.Message, sec=20):
         pass
 
 
-async def handle_violation(m: types.Message, chat_id: int, reason_text: str):
+async def handle_violation(m: types.Message, chat_id: int, reason_text: str, is_vip: bool = False):
     uid = m.from_user.id
     mention = m.from_user.mention_html()
     
@@ -1757,6 +3045,21 @@ async def handle_violation(m: types.Message, chat_id: int, reason_text: str):
         await m.delete()
     except Exception:
         pass
+
+    # VIP Moderatsiya: Spam, stavka, scam havolalar va firibgarlarni darhol guruhdan ban qilish
+    if is_vip:
+        q("UPDATE channels SET bans = bans + 1 WHERE group_id=?", (chat_id,), commit=True)
+        try:
+            await bot.ban_chat_member(chat_id, uid)
+            q("DELETE FROM violations WHERE chat_id=? AND user_id=?", (chat_id, uid), commit=True)
+            punish_msg = await m.answer(
+                f"🛡 <b>VIP MODERATSIYA (MAX BIZNES):</b>\n"
+                f"⛔ {mention} firibgarlik, stavka yoki spam tarqatgani sababli <b>darhol guruhdan chiqarildi (BAN)!</b>"
+            )
+            asyncio.create_task(delete_later(punish_msg, 25))
+            return
+        except Exception as e:
+            logging.error(f"VIP ban xatosi: {e}")
         
     r = q("SELECT warnings, cycle FROM violations WHERE chat_id=? AND user_id=?", (chat_id, uid), one=True)
     warns, cycle = (r["warnings"], r["cycle"]) if r else (0, 0)
@@ -1806,16 +3109,21 @@ async def group_handler(m: types.Message):
     # Guruhdagi xabarlar statistikasini yangilash
     q("UPDATE channels SET group_messages = group_messages + 1 WHERE group_id=?", (chat_id,), commit=True)
     
-    if await is_admin_of(chat_id, m.from_user.id):
-        return
+    c = q("SELECT * FROM channels WHERE group_id=? AND active=1", (chat_id,), one=True)
+    is_vip = False
+    if c and c.get("owner_id"):
+        sub = get_user_subscription(c["owner_id"])
+        is_vip = (sub["plan_info"].get("moderation") == "vip")
 
-    # So'kinish yoki haqorat
-    if PROFANITY_RE.search(text_content):
-        return await handle_violation(m, chat_id, "guruhda so'kinish, haqorat va kamsitish taqiqlanadi")
-        
-    # Firibgarlik (masheniklik) va spam
-    if SCAM_RE.search(text_content):
-        return await handle_violation(m, chat_id, "guruhda firibgarlik, spam va noqonuniy reklamalar qat'iyan man etiladi")
+    is_chat_admin = await is_admin_of(chat_id, m.from_user.id)
+    if not is_chat_admin:
+        # So'kinish yoki haqorat
+        if PROFANITY_RE.search(text_content):
+            return await handle_violation(m, chat_id, "guruhda so'kinish, haqorat va kamsitish taqiqlanadi", is_vip=False)
+            
+        # Firibgarlik (masheniklik), stavka va spam
+        if SCAM_RE.search(text_content):
+            return await handle_violation(m, chat_id, "guruhda firibgarlik, spam va noqonuniy reklamalar qat'iyan man etiladi", is_vip=is_vip)
     
     c = q("SELECT * FROM channels WHERE group_id=? AND active=1", (chat_id,), one=True)
     channel_id = c["channel_id"] if c else 0
@@ -1830,32 +3138,45 @@ async def group_handler(m: types.Message):
     
     if replied or mentioned:
         clean_query = re.sub(f"@{me.username}", "", text_content, flags=re.I).strip()
-        ai_prompt = (
+        system_prompt = (
             f"Sen ushbu guruhning oliy toifali, juda xushmuomala ekspert yordamchisisan.\n"
             f"Kanal yo'nalishi: {c['niche'] if c else 'Dasturlash, texnologiya va internet loyihalari'}.\n\n"
             "Qoidalar:\n"
             "- O'zbek tilida, do'stona, qisqa (2-4 gap) va aniq foydali javob ber.\n"
             "- Shriftlarni chiroyli formatla: qalin <b>...</b>, kodlar <code>...</code>.\n"
-            "- O'zingni AI deb atama, mutaxassis sifatida gapir.\n\n"
-            f"Foydalanuvchi savoli: {clean_query}"
+            "- O'zingni AI deb atama, mutaxassis sifatida gapir."
         )
+        ai_prompt = f"Foydalanuvchi savoli: {clean_query}"
+        ans = ""
+        
+        # 1. Eng tezkor Groq AI orqali javob olish (0.3 soniyada)
         try:
-            client = get_gemini_client()
-            ans = ""
-            for m_try in ["gemini-3.8-flash", GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash"]:
-                try:
-                    r = await client.aio.models.generate_content(model=m_try, contents=ai_prompt)
-                    ans = (r.text or "").strip()
-                    if ans:
-                        break
-                except Exception:
-                    continue
-            if ans:
+            ans = await ask_groq_ai(ai_prompt, system_prompt=system_prompt)
+        except Exception as e_groq:
+            logging.warning(f"Groq javob xatosi: {e_groq}")
+            
+        # 2. Agar Groq javob bermasa -> Gemini AI zaxirasi
+        if not ans:
+            try:
+                client = get_gemini_client()
+                for m_try in ["gemini-3.8-flash", GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash"]:
+                    try:
+                        r = await client.aio.models.generate_content(model=m_try, contents=f"{system_prompt}\n\n{ai_prompt}")
+                        ans = (r.text or "").strip()
+                        if ans:
+                            break
+                    except Exception:
+                        continue
+            except Exception as e:
+                logging.warning(f"Gemini fallback xatosi: {e}")
+                
+        if ans:
+            try:
                 await m.reply(ans)
-            else:
-                await m.reply("Savolingiz uchun katta rahmat! 🤝 Tez orada bu bo'yicha batafsil ma'lumot beramiz ✨")
-        except Exception as e:
-            logging.error(f"Guruhda AI javob xatosi: {e}")
+            except Exception:
+                clean_ans = re.sub(r"<[^>]+>", "", ans)
+                await m.reply(clean_ans, parse_mode=None)
+        else:
             await m.reply("Savolingiz uchun katta rahmat! 🤝 Tez orada bu bo'yicha batafsil ma'lumot beramiz ✨")
     else:
         gratitude_responses = [
@@ -1896,25 +3217,80 @@ async def on_chat_member(e: types.ChatMemberUpdated):
 AdminMsg = F.from_user.id.in_(ADMIN_IDS)
 
 
+def get_admin_panel_text() -> str:
+    # 1. Jami foydalanuvchilar
+    u_row = q("SELECT COUNT(*) as c FROM users", one=True)
+    users_count = u_row["c"] if u_row else 0
+
+    # 2. Ulangan kanallar
+    ch_row = q("SELECT COUNT(*) as c FROM channels WHERE active=1", one=True)
+    channels_count = ch_row["c"] if ch_row else 0
+
+    # 3. Ulangan guruhlar
+    gr_row = q("SELECT COUNT(DISTINCT group_id) as c FROM channels WHERE group_id IS NOT NULL AND group_id != 0", one=True)
+    groups_count = gr_row["c"] if gr_row else 0
+
+    # 4. Bugun chiqarilgan jami postlar
+    today_s = datetime.now(TZ).strftime("%Y-%m-%d")
+    rp_row = q("SELECT COUNT(*) as c FROM recent_posts WHERE created_at LIKE ?", (f"{today_s}%",), one=True)
+    sub_posts_row = q("SELECT SUM(daily_posts_count) as c FROM subscriptions WHERE last_post_date = ?", (today_s,), one=True)
+    today_posts_count = max(rp_row["c"] if rp_row else 0, sub_posts_row["c"] if (sub_posts_row and sub_posts_row["c"]) else 0)
+
+    # 5. Tariflar bo'yicha obunachilar
+    start_row = q("SELECT COUNT(*) as c FROM subscriptions WHERE plan_name='start'", one=True)
+    start_users = start_row["c"] if start_row else 0
+    pro_row = q("SELECT COUNT(*) as c FROM subscriptions WHERE plan_name='pro'", one=True)
+    pro_users = pro_row["c"] if pro_row else 0
+    max_row = q("SELECT COUNT(*) as c FROM subscriptions WHERE plan_name='max'", one=True)
+    max_users = max_row["c"] if max_row else 0
+
+    if start_users == 0 and pro_users == 0 and max_users == 0:
+        st_r = q("SELECT COUNT(*) as c FROM users WHERE plan IS NULL OR plan='' OR plan='start' OR plan='basic'", one=True)
+        start_users = st_r["c"] if st_r else 0
+        pr_r = q("SELECT COUNT(*) as c FROM users WHERE plan IN ('pro', 'standard')", one=True)
+        pro_users = pr_r["c"] if pr_r else 0
+        mx_r = q("SELECT COUNT(*) as c FROM users WHERE plan='max'", one=True)
+        max_users = mx_r["c"] if mx_r else 0
+
+    # 6. Botning uzluksiz ishlash vaqti (Uptime)
+    uptime = get_bot_uptime()
+
+    text = (
+        f"📊 <b>BOTNING TO'LIQ STATISTIKASI:</b>\n"
+        f"👥 <b>Jami foydalanuvchilar:</b> {users_count} ta\n"
+        f"📢 <b>Ulangan kanallar:</b> {channels_count} ta\n"
+        f"💬 <b>Ulangan guruhlar:</b> {groups_count} ta\n"
+        f"📝 <b>Bugun chiqarilgan jami postlar:</b> {today_posts_count} ta\n"
+        f"💎 <b>Tariflar bo'yicha obunachilar:</b>\n"
+        f"   ├ <b>Start (Bepul):</b> {start_users} ta\n"
+        f"   ├ <b>Pro:</b> {pro_users} ta\n"
+        f"   └ <b>Max Media:</b> {max_users} ta\n"
+        f"⏳ <b>Botning uzluksiz ishlash vaqti (Uptime):</b> {uptime}"
+    )
+    return text
+
+
+def get_admin_panel_keyboard():
+    return ik(
+        [("💾 Zaxira nusxani olish (Backup)", "adm:backup_export")],
+        [("📥 Zaxirani tiklash (Restore)", "adm:restore_backup")],
+        [("📢 Hammaga xabar yuborish (Broadcast)", "adm:bcast")],
+        [("⚙️ Foydalanuvchini boshqarish / Tarif berish", "adm:user")],
+        [("💳 To'lovlar & Karta", "adm:card"), ("🔑 AI Kalitlar sozlamasi", "adm:keys_menu")],
+        [("📺 Barcha Kanallar", "adm:channels"), ("🔄 Yangilash", "adm:refresh")]
+    )
+
+
 @dp.message(Command("admin"), F.chat.type == "private", AdminMsg)
 async def admin_panel(m: types.Message, state: FSMContext):
     await state.clear()
-    card_num, card_own = get_card_info()
-    g_key = get_gemini_api_key()
-    masked_g = (g_key[:6] + "..." + g_key[-4:]) if len(g_key) > 10 else (g_key or "Kiritilmagan")
-    await m.answer(
-        "🛠 <b>BOSH ADMIN BOSHQARUV PANELI</b>\n\n"
-        f"💳 <b>Hozirgi karta:</b> <code>{card_num}</code> ({html.escape(card_own)})\n"
-        f"🔑 <b>Gemini AI Kalit:</b> <code>{masked_g}</code>\n\n"
-        "<i>Quyidagi bo'limlardan birini tanlang:</i>",
-        reply_markup=ik(
-            [("📊 Umumiy Statistika", "adm:stats"), ("💳 Kutilayotgan To'lovlar", "adm:pay")],
-            [("💳 Karta Sozlamalari", "adm:card"), ("🔑 Gemini AI Kaliti", "adm:gemini")],
-            [("👥 Foydalanuvchini boshqarish", "adm:user"), ("📺 Barcha Kanallar", "adm:channels")],
-            [("💾 Baza Zaxirasi (Backup)", "adm:backup"), ("📣 Reklama Yuborish (Broadcast)", "adm:bcast")],
-            [("🔒 Majburiy Kanallar", "adm:req")],
-        )
-    )
+    text = get_admin_panel_text()
+    await m.answer(text, reply_markup=get_admin_panel_keyboard())
+
+
+@dp.message(Command("admin"), F.chat.type == "private")
+async def admin_unauthorized(m: types.Message):
+    await m.answer("⛔️ <b>Ruxsat berilmagan!</b> Ushbu buyruq faqat bot adminlari uchun mo'ljallangan.")
 
 
 # --- KARTA SOZLAMALARI ---
@@ -2028,68 +3404,233 @@ async def adm_savegemini(m: types.Message, state: FSMContext):
         )
 
 
-# --- BAZA ZAXIRASI (BACKUP / RESTORE) ---
-@dp.callback_query(AdminMsg, F.data == "adm:backup")
-async def adm_backup_menu(cb: types.CallbackQuery):
-    count = q("SELECT COUNT(*) c FROM channels", one=True)["c"]
+# --- GROQ AI SOZLAMALARI ---
+@dp.callback_query(AdminMsg, F.data == "adm:groq")
+async def adm_groq(cb: types.CallbackQuery):
+    key = get_groq_api_key()
+    masked = (key[:6] + "..." + key[-4:]) if len(key) > 10 else (key or "Kiritilmagan")
     await cb.message.answer(
-        "💾 <b>BAZA ZAXIRASI (BACKUP & RESTORE):</b>\n\n"
-        f"Render serveri qayta ishga tushganda kanallar o'chib ketmasligi uchun zaxira nusxasini saqlab qo'yishingiz mumkin.\n"
-        f"📊 <b>Bazadagi joriy kanallar:</b> <b>{count} ta</b>\n\n"
-        "<i>Quyidagi amallardan birini tanlang:</i>",
+        "⚡️ <b>GROQ AI KALITI VA SOZLAMALARI:</b>\n\n"
+        f"🗝 <b>Joriy kalit:</b> <code>{masked}</code>\n"
+        "🤖 <b>Vazifasi:</b> Guruh chati muloqoti va zaxira post/poll generatsiyasi (0.3 soniyada)\n\n"
+        "<i>Quyidagi amallardan birini tanlang 👇</i>",
         reply_markup=ik(
-            [("📥 Zaxira faylini yuklab olish (Eksport)", "adm:download_backup")],
-            [("📤 Zaxira faylidan tiklash (Import)", "adm:restore_backup")],
+            [("🧪 Kalitni sinab ko'rish (Test)", "adm:testgroq")],
+            [("✏️ Yangi Groq kalit kiritish", "adm:setgroq")],
             [("🔙 Orqaga", "adm:back")]
         )
     )
     await cb.answer()
 
 
-@dp.callback_query(AdminMsg, F.data == "adm:download_backup")
-async def adm_download_backup(cb: types.CallbackQuery):
-    auto_backup_channels()
-    if os.path.exists(BACKUP_FILE):
-        doc = types.FSInputFile(BACKUP_FILE, filename=f"channels_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json")
-        await bot.send_document(cb.from_user.id, document=doc, caption="💾 <b>Ulangan barcha kanallarning zaxira nusxasi!</b>")
+@dp.callback_query(AdminMsg, F.data == "adm:testgroq")
+async def adm_testgroq(cb: types.CallbackQuery):
+    await cb.answer("⏳ Groq AI tekshirilmoqda...")
+    ok, msg = await test_groq_key()
+    if ok:
+        await cb.message.answer(f"✅ <b>Groq AI to'liq ishlamoqda!</b>\n\n{msg}")
     else:
-        await cb.message.answer("⚠️ Hozircha bazada kanallar mavjud emas.")
+        await cb.message.answer(f"❌ <b>Groq AI ulanmadi!</b>\n\nSababi: <code>{msg}</code>")
+
+
+@dp.callback_query(AdminMsg, F.data == "adm:setgroq")
+async def adm_setgroq(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminGroq.key)
+    await cb.message.answer(
+        "⚡️ <b>Yangi Groq API kalitini yuboring:</b>\n\n"
+        "(odatda <code>gsk_...</code> bilan boshlanadi).\n\n"
+        "Bekor qilish: /cancel"
+    )
     await cb.answer()
 
 
-@dp.callback_query(AdminMsg, F.data == "adm:restore_backup")
+@dp.message(AdminGroq.key, AdminMsg, F.text)
+async def adm_savegroq(m: types.Message, state: FSMContext):
+    new_key = m.text.strip()
+    q("INSERT OR REPLACE INTO settings (key, value) VALUES ('groq_api_key', ?)", (new_key,), commit=True)
+    await state.clear()
+    
+    ok, msg = await test_groq_key(new_key)
+    if ok:
+        await m.answer(f"🎉 <b>Yangi Groq API kaliti saqlandi va tekshirildi!</b>\n\n{msg}", reply_markup=MENU)
+    else:
+        await m.answer(
+            f"⚠️ <b>Kalit saqlandi, lekin xato qaytardi:</b>\n<code>{msg}</code>",
+            reply_markup=MENU
+        )
+
+
+# --- YOUTUBE DATA API SOZLAMALARI ---
+@dp.callback_query(AdminMsg, F.data == "adm:youtube")
+async def adm_youtube(cb: types.CallbackQuery):
+    key = get_youtube_api_key()
+    masked = (key[:6] + "..." + key[-4:]) if len(key) > 10 else (key or "Kiritilmagan (Avto-qidiruv faol)")
+    await cb.message.answer(
+        "🎥 <b>YOUTUBE DATA API V3 SOZLAMALARI:</b>\n\n"
+        f"🗝 <b>Joriy kalit:</b> <code>{masked}</code>\n"
+        "🤖 <b>Vazifasi:</b> MAX tarifi uchun so'nggi 7 kundagi eng qaynoq va ommabop 3-5 ta videolarni tahlil qilish.\n"
+        "💡 <i>Eslatma: Kalit bo'lmasa ham tizim avtomatik zaxira qidiruv orqali ishlayveradi!</i>\n\n"
+        "<i>Quyidagi amallardan birini tanlang 👇</i>",
+        reply_markup=ik(
+            [("🧪 Kalitni sinab ko'rish (Test)", "adm:testyoutube")],
+            [("✏️ Yangi YouTube kalit kiritish", "adm:setyoutube")],
+            [("🔙 Orqaga", "adm:back")]
+        )
+    )
+    await cb.answer()
+
+
+@dp.callback_query(AdminMsg, F.data == "adm:testyoutube")
+async def adm_testyoutube(cb: types.CallbackQuery):
+    await cb.answer("⏳ YouTube API tekshirilmoqda...")
+    ok, msg = await test_youtube_key()
+    if ok:
+        await cb.message.answer(f"✅ <b>YouTube Data API to'liq ishlamoqda!</b>\n\n{msg}")
+    else:
+        await cb.message.answer(f"❌ <b>YouTube API ulanmadi!</b>\n\nSababi: <code>{msg}</code>")
+
+
+@dp.callback_query(AdminMsg, F.data == "adm:setyoutube")
+async def adm_setyoutube(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminYouTube.key)
+    await cb.message.answer(
+        "🎥 <b>Yangi YouTube Data API v3 kalitini yuboring:</b>\n\n"
+        "(Google Cloud Console orqali olinadi, odatda <code>AIzaSy...</code> bilan boshlanadi).\n\n"
+        "Bekor qilish: /cancel"
+    )
+    await cb.answer()
+
+
+@dp.message(AdminYouTube.key, AdminMsg, F.text)
+async def adm_saveyoutube(m: types.Message, state: FSMContext):
+    new_key = m.text.strip()
+    q("INSERT OR REPLACE INTO settings (key, value) VALUES ('youtube_api_key', ?)", (new_key,), commit=True)
+    await state.clear()
+    
+    ok, msg = await test_youtube_key(new_key)
+    if ok:
+        await m.answer(f"🎉 <b>Yangi YouTube API kaliti saqlandi va tekshirildi!</b>\n\n{msg}", reply_markup=MENU)
+    else:
+        await m.answer(
+            f"⚠️ <b>Kalit saqlandi, lekin tekshiruvda xatolik:</b>\n<code>{msg}</code>\n\n"
+            "Eslatma: Kalitsiz ham bot avtomatik YouTube trendlarini yuklayveradi.",
+            reply_markup=MENU
+        )
+
+
+# --- BAZA ZAXIRASI (BACKUP / RESTORE) ---
+@dp.callback_query(AdminMsg, F.data.in_(["adm:backup", "adm:backup_export", "adm:download_backup"]))
+async def adm_backup_export(cb: types.CallbackQuery):
+    await cb.answer("⏳ Zaxira fayli yaratilmoqda...")
+    try:
+        filepath = create_backup_file()
+        if not os.path.exists(filepath):
+            return await cb.message.answer("❌ Zaxira fayli yaratib bo'lmadi.")
+        filename = os.path.basename(filepath)
+        doc = types.FSInputFile(filepath, filename=filename)
+        caption = (
+            f"💾 <b>BOT MA'LUMOTLAR BAZASI ZAXIRASI (BACKUP)</b>\n\n"
+            f"📅 <b>Sana:</b> <code>{datetime.now(TZ).strftime('%d.%m.%Y %H:%M:%S')}</code>\n"
+            f"📁 <b>Fayl:</b> <code>{filename}</code>\n"
+            f"📦 <b>Qamrab olingan:</b> Users, Channels, Subscriptions, Settings, Recent Posts.\n\n"
+            f"<i>Ushbu fayl orqali botni istalgan payt '📥 Zaxirani tiklash' tugmasi bilan qayta tiklashingiz mumkin.</i>"
+        )
+        await cb.message.answer_document(doc, caption=caption)
+    except Exception as e:
+        logging.error(f"Backup yuborish xatosi: {e}")
+        await cb.message.answer(f"❌ <b>Xatolik yuz berdi:</b> <code>{html.escape(str(e))}</code>")
+
+
+@dp.callback_query(AdminMsg, F.data.in_(["adm:restore", "adm:restore_backup", "adm:restore_import"]))
 async def adm_restore_backup(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminRestore.file)
-    await cb.message.answer("📤 <b>Iltimos, avval yuklab olingan zaxira (.json) faylini shu yerga yuboring:</b>\n\nBekor qilish: /cancel")
+    await cb.message.answer(
+        "📥 <b>BAZANI QAYTA TIKLASH (RESTORE / IMPORT)</b>\n\n"
+        "Iltimos, avval yuklab olingan zaxira (<b>.json</b> yoki <b>.db</b>) faylini menga yuboring...\n\n"
+        "<i>Bekor qilish: /cancel</i>"
+    )
     await cb.answer()
 
 
 @dp.message(AdminRestore.file, AdminMsg, F.document)
 async def adm_process_restore_file(m: types.Message, state: FSMContext):
-    file_info = await bot.get_file(m.document.file_id)
-    await bot.download_file(file_info.file_path, BACKUP_FILE)
-    restored_count = auto_restore_channels()
+    doc = m.document
+    fname = (doc.file_name or "").lower()
+    if not (fname.endswith(".json") or fname.endswith(".db") or fname.endswith(".sqlite")):
+        return await m.answer(
+            "❌ <b>Noto'g'ri fayl formati!</b>\n\n"
+            "Faqat <code>.json</code> yoki <code>.db</code> formatidagi zaxira fayllarini yuboring.\n"
+            "Bekor qilish: /cancel"
+        )
+
     await state.clear()
-    await m.answer(f"🎉 <b>Baza muvaffaqiyatli tiklandi!</b> Jami <b>{restored_count} ta</b> kanal qayta tiklandi.", reply_markup=MENU)
+    status_msg = await m.answer("⏳ <b>Zaxira fayli tekshirilmoqda va tiklanmoqda...</b>")
+
+    temp_dir = "temp_backups"
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_path = os.path.join(temp_dir, f"restore_{int(time.time())}_{doc.file_name}")
+
+    try:
+        file_info = await bot.get_file(doc.file_id)
+        await bot.download_file(file_info.file_path, temp_path)
+
+        ok, summary = restore_database_from_file(temp_path)
+        if ok:
+            await status_msg.edit_text(
+                f"✅ <b>Barcha ma'lumotlar va kanallar muvaffaqiyatli qayta tiklandi!</b>\n\n"
+                f"📊 <b>Tiklash hisoboti:</b>\n{summary}",
+                reply_markup=get_admin_panel_keyboard()
+            )
+        else:
+            await status_msg.edit_text(
+                f"❌ <b>Zaxirani tiklashda xatolik yuz berdi:</b>\n"
+                f"<code>{html.escape(summary)}</code>\n\n"
+                "⚠️ Amaliyot xavfsiz to'xtatildi, mavjud ma'lumotlar o'zgarishsiz qoldi."
+            )
+    except Exception as e:
+        logging.error(f"Fayl tiklash xatosi: {e}")
+        await status_msg.edit_text(
+            f"❌ <b>Zaxirani tiklash jarayonida xatolik:</b>\n"
+            f"<code>{html.escape(str(e))}</code>\n\n"
+            "⚠️ Bot barqaror ishlashda davom etmoqda."
+        )
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 
-@dp.callback_query(AdminMsg, F.data == "adm:back")
+@dp.callback_query(AdminMsg, F.data.in_(["adm:back", "adm:refresh"]))
 async def adm_back_btn(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    card_num, card_own = get_card_info()
+    text = get_admin_panel_text()
+    try:
+        await cb.message.edit_text(text, reply_markup=get_admin_panel_keyboard())
+    except Exception:
+        await cb.message.answer(text, reply_markup=get_admin_panel_keyboard())
+    await cb.answer()
+
+
+@dp.callback_query(AdminMsg, F.data == "adm:keys_menu")
+async def adm_keys_menu(cb: types.CallbackQuery):
     g_key = get_gemini_api_key()
     masked_g = (g_key[:6] + "..." + g_key[-4:]) if len(g_key) > 10 else (g_key or "Kiritilmagan")
-    await cb.message.edit_text(
-        "🛠 <b>BOSH ADMIN BOSHQARUV PANELI</b>\n\n"
-        f"💳 <b>Hozirgi karta:</b> <code>{card_num}</code> ({html.escape(card_own)})\n"
-        f"🔑 <b>Gemini AI Kalit:</b> <code>{masked_g}</code>\n\n"
-        "<i>Quyidagi bo'limlardan birini tanlang:</i>",
+    gr_key = get_groq_api_key()
+    masked_gr = (gr_key[:6] + "..." + gr_key[-4:]) if len(gr_key) > 10 else (gr_key or "Kiritilmagan")
+    yt_key = get_youtube_api_key()
+    masked_yt = (yt_key[:6] + "..." + yt_key[-4:]) if len(yt_key) > 10 else (yt_key or "Avto")
+    await cb.message.answer(
+        "🔑 <b>AI VA TIZIM KALITLARI SOZLAMALARI:</b>\n\n"
+        f"🌐 <b>Gemini AI:</b> <code>{masked_g}</code>\n"
+        f"⚡️ <b>Groq AI:</b> <code>{masked_gr}</code>\n"
+        f"🎥 <b>YouTube API:</b> <code>{masked_yt}</code>\n\n"
+        "<i>Kerakli xizmatni tanlang:</i>",
         reply_markup=ik(
-            [("📊 Umumiy Statistika", "adm:stats"), ("💳 Kutilayotgan To'lovlar", "adm:pay")],
-            [("💳 Karta Sozlamalari", "adm:card"), ("🔑 Gemini AI Kaliti", "adm:gemini")],
-            [("👥 Foydalanuvchini boshqarish", "adm:user"), ("📺 Barcha Kanallar", "adm:channels")],
-            [("💾 Baza Zaxirasi (Backup)", "adm:backup"), ("📣 Reklama Yuborish (Broadcast)", "adm:bcast")],
-            [("🔒 Majburiy Kanallar", "adm:req")],
+            [("🔑 Gemini AI", "adm:gemini"), ("⚡️ Groq AI", "adm:groq")],
+            [("🎥 YouTube API", "adm:youtube"), ("🔒 Majburiy Kanallar", "adm:req")],
+            [("🔙 Admin panelga qaytish", "adm:back")]
         )
     )
     await cb.answer()
@@ -2146,10 +3687,14 @@ async def adm_channels(cb: types.CallbackQuery):
     await cb.answer()
 
 
-@dp.callback_query(AdminMsg, F.data == "adm:user")
+@dp.callback_query(AdminMsg, F.data.in_(["adm:user", "adm:user_manage"]))
 async def adm_user(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminUser.uid)
-    await cb.message.answer("👤 Boshqarmoqchi bo'lgan foydalanuvchining <b>Telegram ID raqami</b>ni yuboring:")
+    await cb.message.answer(
+        "⚙️ <b>FOYDALANUVCHINI BOSHQARISH VA TARIF BERISH:</b>\n\n"
+        "Boshqarmoqchi bo'lgan foydalanuvchining <b>Telegram ID raqami</b>ni yuboring:\n\n"
+        "<i>Bekor qilish: /cancel</i>"
+    )
     await cb.answer()
 
 
@@ -2159,14 +3704,18 @@ def user_admin_card(uid):
         return None, None
     plan, exp = get_user_plan(uid)
     n = q("SELECT COUNT(*) c FROM channels WHERE owner_id=?", (uid,), one=True)["c"]
-    text = (f"👤 <b>Foydalanuvchi:</b> {html.escape(u['full_name'] or '')} (<code>{uid}</code>)\n"
-            f"🔗 @{u['username'] or 'Yo`q'}\n"
-            f"💎 <b>Tarif:</b> {PLANS[plan]['name'] + ' (' + fmt(exp) + ' gacha)' if plan else 'Yo`q'}\n"
-            f"📺 <b>Kanallar soni:</b> {n} ta\n"
-            f"⚙️ <b>Holat:</b> {'🚫 Bloklangan' if u['banned'] else '✅ Faol'}")
+    p_info = PLANS.get(plan, PLANS["start"])
+    text = (
+        f"👤 <b>Foydalanuvchi:</b> {html.escape(u['full_name'] or '')} (<code>{uid}</code>)\n"
+        f"🔗 @{u['username'] or 'Yo`q'}\n"
+        f"💎 <b>Joriy tarif:</b> <b>{p_info['name']}</b>" + (f" ({fmt(exp)} gacha)" if exp else " (Cheksiz / Bepul)") + "\n"
+        f"📺 <b>Ulangan kanallar soni:</b> {n} ta\n"
+        f"⚙️ <b>Holati:</b> {'🚫 Bloklangan' if u['banned'] else '✅ Faol'}"
+    )
     kb = ik(
-        [(f"🎁 {p['name']} (30 kun)", f"ug:{uid}:{k}") for k, p in PLANS.items()],
-        [("❌ Tarifni bekor qilish", f"urev:{uid}"), ("🚫 Bloklash / ✅ Ochish", f"uban:{uid}")],
+        [("🎁 START (Bepul)", f"ug:{uid}:start"), ("🎁 PRO KANAL (30 kun)", f"ug:{uid}:pro")],
+        [("🎁 MAX MEDIA (30 kun)", f"ug:{uid}:max"), ("❌ Tarifni bekor qilish", f"urev:{uid}")],
+        [("🚫 Bloklash / ✅ Ochish", f"uban:{uid}"), ("🔙 Admin panel", "adm:back")]
     )
     return text, kb
 
@@ -2194,6 +3743,7 @@ async def adm_user_action(cb: types.CallbackQuery):
             pass
     elif parts[0] == "urev":
         q("UPDATE users SET plan=NULL, expires_at=NULL WHERE user_id=?", (uid,), commit=True)
+        q("UPDATE subscriptions SET plan_name='start', expires_at=NULL WHERE user_id=?", (uid,), commit=True)
     else:
         q("UPDATE users SET banned = 1 - banned WHERE user_id=?", (uid,), commit=True)
     text, kb = user_admin_card(uid)
@@ -2277,16 +3827,28 @@ async def bc_go(cb: types.CallbackQuery, state: FSMContext):
     if d["target"] in ("channels", "both"):
         targets += [r["channel_id"] for r in q("SELECT channel_id FROM channels")]
     
-    await cb.message.answer(f"🚀 <b>Reklama yuborish boshlandi:</b> <code>{len(targets)} ta</code> manzil...")
+    await cb.message.answer(f"🚀 <b>Xabar yuborish boshlandi:</b> <code>{len(targets)} ta</code> manzil...")
     ok = fail = 0
     for t in targets:
         try:
             await bot.copy_message(t, d["chat_id"], d["msg_id"])
             ok += 1
+        except TelegramRetryAfter as e_retry:
+            await asyncio.sleep(e_retry.retry_after + 1)
+            try:
+                await bot.copy_message(t, d["chat_id"], d["msg_id"])
+                ok += 1
+            except Exception:
+                fail += 1
         except Exception:
             fail += 1
-        await asyncio.sleep(0.05)
-    await cb.message.answer(f"✅ <b>Yuborish yakunlandi!</b>\nYetkazildi: <b>{ok} ta</b>\nXatolik: <b>{fail} ta</b>")
+        await asyncio.sleep(0.04)
+    await cb.message.answer(
+        f"✅ <b>Yuborish yakunlandi!</b>\n\n"
+        f"Yetkazildi: <b>{ok} ta</b>\n"
+        f"Yetkazilmadi (bloklangan/o'chirilgan): <b>{fail} ta</b>",
+        reply_markup=get_admin_panel_keyboard()
+    )
     await cb.answer()
 
 
@@ -2319,20 +3881,56 @@ async def run_render_web_server():
             logging.warning(f"Health server xatosi: {e}")
 
 
+async def weekly_stats_report():
+    """
+    MAX MEDIA / BIZNES tarifi uchun har haftalik kanal faolligi va o'sish statistikasi hisoboti.
+    """
+    try:
+        max_users = q("SELECT user_id FROM subscriptions WHERE plan_name='max'")
+        for u in max_users:
+            uid = u["user_id"]
+            chs = q("SELECT * FROM channels WHERE owner_id=? AND active=1", (uid,))
+            if not chs:
+                continue
+            text = "📈 <b>HAFTALIK KANAL FAOLLIGI VA O'SISH STATISTIKASI</b>\n\n"
+            for c in chs:
+                text += (
+                    f"📺 <b>Kanal:</b> <b>{html.escape(c['title'])}</b>\n"
+                    f"📝 <b>Chiqarilgan postlar:</b> {c['posts_sent']} ta\n"
+                    f"📊 <b>So'rovnomalar:</b> {c['polls_sent']} ta\n"
+                    f"👥 <b>Yangi a'zolar:</b> +{c['joined']} ta\n"
+                    f"🚪 <b>Chiqib ketganlar:</b> -{c['left_count']} ta\n"
+                    f"💬 <b>Guruhdagi xabarlar:</b> {c['group_messages']} ta\n"
+                    f"🛡 <b>Moderatsiya (ogohlantirish va ban):</b> {c['warnings'] + c['bans']} ta\n\n"
+                )
+            text += "<i>Ushbu tahliliy hisobot har hafta «MAX MEDIA / BIZNES» tarifi foydalanuvchilariga avtomatik taqdim etiladi.</i>"
+            try:
+                await bot.send_message(uid, text)
+            except Exception as e_send:
+                logging.warning(f"Haftalik hisobot yuborishda xato ({uid}): {e_send}")
+    except Exception as e:
+        logging.warning(f"Haftalik hisobot generatori xatosi: {e}")
+
+
 async def main():
     await run_render_web_server()
     scheduler.add_job(scheduled_tasks, "cron", minute=0)
     scheduler.add_job(expiry_reminders, "cron", hour=10, minute=0)
+    scheduler.add_job(weekly_stats_report, "cron", day_of_week="sun", hour=20, minute=0)
+    scheduler.add_job(nightly_auto_backup, "cron", hour=0, minute=0)
     scheduler.start()
     logging.info(f"Bot to'liq ishga tushdi! Model: {GEMINI_MODEL}, Admin: {ADMIN_IDS}")
-    try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    except Exception as e:
-        if "Unauthorized" in str(e):
-            logging.critical("❌ XATOLIK: Bot Tokeni noto'g'ri yoki Telegram (@BotFather) tomonidan bekor qilingan (Unauthorized)!\n"
-                             "Iltimos, @BotFather orqali bot tokeningizni yangilang va BOT_TOKEN o'zgaruvchisiga kiriting.")
-        else:
-            logging.error(f"Polling to'xtadi: {e}")
+    while True:
+        try:
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            break
+        except Exception as e:
+            if "Unauthorized" in str(e):
+                logging.critical("❌ XATOLIK: Bot Tokeni noto'g'ri yoki Telegram (@BotFather) tomonidan bekor qilingan (Unauthorized)!\n"
+                                 "Iltimos, @BotFather orqali bot tokeningizni yangilang va BOT_TOKEN o'zgaruvchisiga kiriting.")
+                break
+            logging.error(f"⚠️ Telegram ulanishida uzilish: {e}. 5 soniyadan so'ng qayta ulanmoqda...")
+            await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
