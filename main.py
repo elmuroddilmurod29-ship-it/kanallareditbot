@@ -287,20 +287,17 @@ def init_db():
         PRIMARY KEY (user_id, code)
     );
     CREATE TABLE IF NOT EXISTS channel_giveaways (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        channel_id INTEGER,
-        message_id INTEGER,
-        prize TEXT,
-        winners_count INTEGER DEFAULT 1,
-        status TEXT DEFAULT 'active',
-        created_at TEXT
+        id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER DEFAULT 0,
+        channel_id INTEGER, message_id INTEGER, prize TEXT,
+        prize_type TEXT DEFAULT 'uc', secret_code TEXT DEFAULT '', site_url TEXT DEFAULT '',
+        winners_count INTEGER DEFAULT 1, repeat_type TEXT DEFAULT 'once', repeat_time TEXT DEFAULT '',
+        status TEXT DEFAULT 'active', ends_at TEXT, created_at TEXT
     );
     CREATE TABLE IF NOT EXISTS giveaway_participants (
-        giveaway_id INTEGER,
-        user_id INTEGER,
-        user_name TEXT,
-        joined_at TEXT,
-        PRIMARY KEY (giveaway_id, user_id)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        giveaway_id INTEGER, user_id INTEGER, user_name TEXT,
+        joined_at TEXT, is_winner INTEGER DEFAULT 0, is_claimed INTEGER DEFAULT 0, claimed_at TEXT DEFAULT '',
+        UNIQUE(giveaway_id, user_id)
     );
     CREATE TABLE IF NOT EXISTS subscriptions (
         user_id INTEGER PRIMARY KEY,
@@ -335,6 +332,32 @@ def init_db():
     ]:
         try:
             db.execute(f"ALTER TABLE channels ADD COLUMN {col} {col_type}")
+            db.commit()
+        except Exception:
+            pass
+
+    for col, col_type in [
+        ("owner_id", "INTEGER DEFAULT 0"),
+        ("prize_type", "TEXT DEFAULT 'uc'"),
+        ("secret_code", "TEXT DEFAULT ''"),
+        ("site_url", "TEXT DEFAULT ''"),
+        ("repeat_type", "TEXT DEFAULT 'once'"),
+        ("repeat_time", "TEXT DEFAULT ''"),
+        ("ends_at", "TEXT DEFAULT ''"),
+    ]:
+        try:
+            db.execute(f"ALTER TABLE channel_giveaways ADD COLUMN {col} {col_type}")
+            db.commit()
+        except Exception:
+            pass
+
+    for col, col_type in [
+        ("is_winner", "INTEGER DEFAULT 0"),
+        ("is_claimed", "INTEGER DEFAULT 0"),
+        ("claimed_at", "TEXT DEFAULT ''"),
+    ]:
+        try:
+            db.execute(f"ALTER TABLE giveaway_participants ADD COLUMN {col} {col_type}")
             db.commit()
         except Exception:
             pass
@@ -1397,9 +1420,15 @@ class AdminPromo(StatesGroup):
     reward_value = State()
     max_uses = State()
 
-class CreateGiveaway(StatesGroup):
-    prize = State()
-    winners = State()
+class GiveawayWizard(StatesGroup):
+    repeat_mode = State()      # once or repeat
+    repeat_schedule = State()  # schedule time
+    prize_type = State()       # uc, promo, money
+    prize_amount = State()     # amount text e.g. "60 UC"
+    secret_code = State()      # prize/voucher code
+    site_url = State()         # site url e.g. "https://www.midasbuy.com"
+    winners_count = State()    # number of winners
+    channel_id = State()       # selected channel
 
 
 class AdminUser(StatesGroup):
@@ -1485,22 +1514,100 @@ async def check_sub(cb: types.CallbackQuery):
 @dp.message(CommandStart(), F.chat.type == "private")
 async def cmd_start(m: types.Message, state: FSMContext):
     await state.clear()
+    uid = m.from_user.id
     register_user(m.from_user)
-    admin_hint = "\n\n👑 <b>Siz bot adminisiz!</b> Boshqaruv paneli: /admin" if m.from_user.id in ADMIN_IDS else ""
-    await m.answer(
+
+    # 1. Konkurs / Sovrinli o'yinga qo'shilish tekshiruvi: /start gw_123
+    text_parts = m.text.strip().split()
+    if len(text_parts) > 1 and text_parts[1].startswith("gw_"):
+        try:
+            gw_id = int(text_parts[1].replace("gw_", ""))
+            await handle_giveaway_join(m, gw_id)
+            return
+        except Exception as e_gw:
+            logging.warning(f"Giveaway start join xatosi: {e_gw}")
+
+    # 2. G'oliblarga yutuqni topshirish tekshiruvi (agar user avval o'yinda yutgan bo'lsa)
+    unclaimed = q(
+        "SELECT gp.rowid as part_id, gp.giveaway_id, cg.prize, cg.prize_type, cg.secret_code, cg.site_url, cg.channel_id "
+        "FROM giveaway_participants gp "
+        "JOIN channel_giveaways cg ON gp.giveaway_id = cg.id "
+        "WHERE gp.user_id=? AND gp.is_winner=1 AND gp.is_claimed=0",
+        (uid,)
+    )
+    if unclaimed:
+        for win in unclaimed:
+            # Obunani qayta tekshirish: kanaldan chiqib ketmaganmi?
+            cid = win["channel_id"]
+            is_sub = True
+            try:
+                mem = await bot.get_chat_member(cid, uid)
+                if mem.status in ("left", "kicked"):
+                    is_sub = False
+            except Exception:
+                pass
+
+            if not is_sub:
+                await m.answer(
+                    f"⚠️ <b>DIQQAT:</b> Siz <b>{html.escape(win['prize'])}</b> sovrinini yutgansiz, "
+                    f"lekin kanalimizdan chiqib ketgansiz!\n\n"
+                    f"Sovrinni olish uchun avval kanalga qayta a'zo bo'ling va so'ng <b>/start</b> bosing.",
+                    reply_markup=MENU
+                )
+                continue
+
+            # Yutuqni topshirish va claimed deb belgilash
+            now_iso = now_utc().isoformat()
+            q("UPDATE giveaway_participants SET is_claimed=1, claimed_at=? WHERE rowid=?", (now_iso, win["part_id"]), commit=True)
+            
+            p_code = win["secret_code"] if win["secret_code"] else "PROMO-YUTUQ-2026"
+            s_url = win["site_url"] if win["site_url"] else "https://www.midasbuy.com"
+            
+            congrats_text = (
+                "🎉 <b>TABRIKLAYMIZ! SIZ SOVRIN YUTIB OLDINGIZ!</b> 🏆🎁\n\n"
+                f"🎮 <b>Sizning yutug'ingiz:</b> <b>{html.escape(win['prize'])}</b>\n\n"
+                f"🔑 <b>Maxfiy yutuq kodingiz (Promokod / Voucher):</b>\n"
+                f"👉 <code>{html.escape(p_code)}</code> 👈\n"
+                f"<i>(Kodni ustiga bossangiz, avtomatik nusxalanadi)</i>\n\n"
+                f"🌐 <b>Faollashtirish platformasi (Sayt):</b>\n"
+                f"🔗 {html.escape(s_url)}\n\n"
+                "📌 <b>Qo'llanma:</b> Yuqoridagi saytga kiring, o'yin ID raqamingizni (yoki hisobingizni) "
+                "kiriting va ushbu promokoddan foydalaning. Sovg'angiz muborak bo'lsin! 🚀"
+            )
+            await m.answer(congrats_text, reply_markup=MENU)
+
+    # 3. Foydalanuvchining joriy tarifi ko'rinishi
+    sub = get_user_subscription(uid)
+    plan = sub["plan_name"]
+    exp = sub["expires_at"]
+    plan_info = PLANS.get(plan, PLANS["start"])
+    plan_title = plan_info["name"]
+
+    if plan != "start" and exp:
+        plan_badge = (
+            f"👑 <b>Sizning faol tarifingiz:</b> 💎 <b>{plan_title}</b>\n"
+            f"⏳ <b>Amal qilish muddati:</b> <code>{fmt(exp)}</code> gacha"
+        )
+    else:
+        plan_badge = f"👑 <b>Sizning faol tarifingiz:</b> 🎁 <b>{plan_title} (Bepul)</b>\n⏳ <b>Muddati:</b> Cheksiz (Muddatsiz)"
+
+    admin_hint = "\n\n👑 <b>Siz bot adminisiz!</b> Boshqaruv paneli: /admin" if uid in ADMIN_IDS else ""
+
+    welcome_text = (
         f"👋 <b>Assalomu alaykum, {html.escape(m.from_user.full_name)}!</b>\n\n"
+        f"{plan_badge}\n\n"
         "🚀 <b>Professional AI Kanal & Guruh Menejeri</b>ga xush kelibsiz!\n\n"
         "⚡️ <b>Imkoniyatlarimiz:</b>\n"
-        "• <b>Rang-barang Postlar</b> — Real keyslar, bepul xostinglar (Render, PythonAnywhere), "
-        "foydali vositalar, YouTube darsliklari, kulgili memlar va mantiqiy o'yinlar!\n"
+        "• <b>Rang-barang Postlar</b> — Real keyslar, bepul xostinglar, foydali vositalar, kulgili memlar va o'yinlar!\n"
         "• 🖼 <b>Xilma-xil Rasmlar</b> — Flux AI san'at asarlari + Internetdan haqiqiy fotolar!\n"
         "• 📊 <b>Kafolatlangan So'rovnomalar</b> — Auditoriyangizni uyg'otuvchi interaktiv ovoz berishlar.\n"
-        "• 🛡 <b>Xushyor Guruh Moderatori</b> — So'kinish, haqorat, kamsitish va firibgarlikni zudlik bilan yo'q qiladi (20 soniyada o'chiradi).\n"
-        "• 💬 <b>Samimiy AI Muloqot</b> — Guruhdagi har bir a'zoga xushmuomala javob qaytaradi va ularning fikriga qarab kanalga post chiqaradi!"
+        "• 🛡 <b>Xushyor Guruh Moderatori</b> — So'kinish, haqorat va firibgarlikni zudlik bilan yo'q qiladi.\n"
+        "• 🎁 <b>Sovrinli O'yinlar (Giveaway)</b> — Kanalingizda PUBG UC, Promokod va pul yutuqlari o'ynash!"
         f"{admin_hint}\n\n"
-        "Pastdagi menyudan boshlang 👇",
-        reply_markup=MENU,
+        "Pastdagi menyudan boshlang 👇"
     )
+
+    await m.answer(welcome_text, reply_markup=MENU)
 
 
 @dp.message(F.chat.type == "private", F.text.in_({"💎 Tariflar & To'lov", "💰 Hisobim"}))
@@ -1667,8 +1774,13 @@ async def user_bk_export_handler(cb: types.CallbackQuery):
     if count == 0:
         return await cb.answer("Sizda hali ulangan kanallar mavjud emas! Avval «➕ Kanal ulash» orqali kanal ulang.", show_alert=True)
     
+    wait_msg = await cb.message.answer("⏳ <b>Shaxsiy zaxira faylingiz tayyorlanmoqda...</b>\n<i>Iltimos, 1-2 daqiqa kuting, ma'lumotlar to'planib fayl yuboriladi.</i>")
     filename, content_bytes = create_user_backup(uid)
     file_doc = types.BufferedInputFile(content_bytes, filename=filename)
+    try:
+        await wait_msg.delete()
+    except Exception:
+        pass
     caption = (
         f"💾 <b>SIZNING SHAXSIY ZAXIRA FAYLINGIZ</b>\n\n"
         f"👤 <b>Foydalanuvchi ID:</b> <code>{uid}</code>\n"
@@ -1704,7 +1816,7 @@ async def user_bk_process_file(m: types.Message, state: FSMContext):
         )
     
     await state.clear()
-    status_msg = await m.answer("⏳ <b>Shaxsiy zaxira fayli tekshirilmoqda va tiklanmoqda...</b>")
+    status_msg = await m.answer("⏳ <b>Shaxsiy zaxira fayli tekshirilmoqda va tiklanmoqda...</b>\n<i>Iltimos, 1-2 daqiqa kuting...</i>")
     
     temp_dir = "temp_backups"
     os.makedirs(temp_dir, exist_ok=True)
@@ -2600,9 +2712,9 @@ def generate_niche_adaptive_post_and_poll(c, theme=None):
             ),
             "funny_memes": (
                 f"😂 <b>Do'stim, senga ham bu holat tanishmi?</b>\n\n"
-                f"— «Og'ayni, bitta kishi qoldi, rush qil, qoni bitta urushlik!» 🗣\n"
+                f"— «Og'ayni, bitta dushman qoldi, rush qil, qoni 1 HP (bitta o'qlik)!» 🗣\n"
                 f"— Yugurib borsang: 4 kishi to'liq kutib olib, 1 soniyada lobbiga jo'natishadi! 💀😂\n\n"
-                f"💡 <i>Agar jamoadoshing 'qoni bitta' desa, shoshilma — orqada tosh borligini tekshir-da, xavotir olmasdan ehtiyotkor o'yna!</i>"
+                f"💡 <i>Agar jamoadoshing 'qoni 1 HP' desa, shoshilma — avval o'zingga qulay ukriti (yopinchiq) topib ol, keyin ehtiyotkor o'yna!</i>"
             ),
             "expert_guide": (
                 f"💎 <b>Do'stim, Butkempda omon qolish va drop olish siri</b>\n\n"
@@ -4012,8 +4124,11 @@ async def scheduled_tasks():
         sub = get_user_subscription(owner_id)
         plan_info = sub["plan_info"]
         
-        # Kunlik post limiti tekshiruvi
-        if sub["daily_posts_count"] >= plan_info.get("daily_post_limit", 1):
+        # Har bir kanal egasining tarifi bo'yicha mustaqil ishlashi
+        cid = c["channel_id"]
+        today_s = datetime.now(TZ).strftime("%Y-%m-%d")
+        ch_today_posts = q("SELECT COUNT(*) as c FROM recent_posts WHERE channel_id=? AND created_at LIKE ?", (cid, f"{today_s}%"), one=True)["c"]
+        if ch_today_posts >= plan_info.get("daily_post_limit", 1):
             continue
             
         allowed_hours = []
@@ -4379,27 +4494,179 @@ def get_admin_panel_keyboard():
 
 
 
-# ============================ PROMO-KOD VA SOVG'ALI O'YINLAR HANDLERLARI ============================
+# ============================ PROMO-KOD VA SOVRINLI O'YINLAR (GIVEAWAY) ============================
+
+async def handle_giveaway_join(m: types.Message, gw_id: int):
+    """Foydalanuvchi kanaldagi 'Sovringa qo'shilish' tugmasi orqali botga kirganda tekshirish va ro'yxatga olish"""
+    gw = q("SELECT * FROM channel_giveaways WHERE id=?", (gw_id,), one=True)
+    if not gw or gw["status"] != "active":
+        return await m.answer(
+            "⚠️ <b>Ushbu sovg'ali o'yin muddati yakunlangan yoki mavjud emas.</b>\n\n"
+            "Kanalimizdagi keyingi sovrinli o'yinlarni kuzatib boring!",
+            reply_markup=MENU
+        )
+
+    cid = gw["channel_id"]
+    uid = m.from_user.id
+
+    # 1. Obunani tekshirish (o'yin kanali + majburiy homiy kanallar)
+    missing = []
+    try:
+        mem = await bot.get_chat_member(cid, uid)
+        if mem.status in ("left", "kicked"):
+            ch_info = q("SELECT * FROM channels WHERE channel_id=?", (cid,), one=True)
+            ch_title = ch_info["title"] if ch_info else "Kanal"
+            inv_link = ""
+            try:
+                inv_link = await bot.export_chat_invite_link(cid)
+            except Exception:
+                inv_link = f"https://t.me/c/{abs(cid)}"
+            missing.append((ch_title, inv_link))
+    except Exception as e_mem:
+        logging.warning(f"Kanal a'zoligini tekshirishda ogohlantirish: {e_mem}")
+
+    # Homiy kanallar tekshiruvi
+    for r in q("SELECT chat FROM required"):
+        try:
+            mem2 = await bot.get_chat_member(r["chat"], uid)
+            if mem2.status in ("left", "kicked"):
+                inv2 = r["chat"] if r["chat"].startswith("http") else f"https://t.me/{r['chat'].lstrip('@')}"
+                missing.append((r["chat"], inv2))
+        except Exception:
+            pass
+
+    if missing:
+        btns = []
+        for title, link in missing:
+            btns.append([(f"📢 {title} ga a'zo bo'lish", None, link)])
+        btns.append([("🔄 Obunani tekshirish", f"gw_chk:{gw_id}")])
+
+        return await m.answer(
+            f"🎁 <b>«{html.escape(gw['prize'])}» SOVRINLI O'YINIDA ISHTIROK ETISH:</b>\n\n"
+            "⚠️ <b>Diqqat:</b> O'yinda qatnashish uchun avval quyidagi kanallarga a'zo bo'lishingiz shart:\n\n"
+            "<i>Barcha kanallarga a'zo bo'lib, pastdagi «🔄 Obunani tekshirish» tugmasini bosing:</i>",
+            reply_markup=ik(*btns)
+        )
+
+    # 2. Allaqachon ro'yxatdan o'tganmi?
+    already = q("SELECT 1 FROM giveaway_participants WHERE giveaway_id=? AND user_id=?", (gw_id, uid), one=True)
+    c_part = q("SELECT COUNT(*) as c FROM giveaway_participants WHERE giveaway_id=?", (gw_id,), one=True)["c"]
+
+    if already:
+        return await m.answer(
+            f"✅ <b>Siz allaqachon ushbu konkursda ishtirok etyapsiz!</b>\n\n"
+            f"🏆 <b>Sovrin:</b> <b>{html.escape(gw['prize'])}</b>\n"
+            f"👥 <b>Jami ishtirokchilar:</b> <code>{c_part} nafar</code>\n\n"
+            "<i>G'oliblar avtomatik tarzda tasodifiy aniqlanadi va kanalimizda e'lon qilinadi. Omad yor bo'lsin! 🍀</i>",
+            reply_markup=MENU
+        )
+
+    # 3. Ro'yxatga qo'shish
+    now_iso = now_utc().isoformat()
+    q("INSERT OR IGNORE INTO giveaway_participants (giveaway_id, user_id, user_name, joined_at) VALUES (?, ?, ?, ?)",
+      (gw_id, uid, m.from_user.full_name or "Ishtirokchi", now_iso), commit=True)
+
+    new_count = q("SELECT COUNT(*) as c FROM giveaway_participants WHERE giveaway_id=?", (gw_id,), one=True)["c"]
+
+    await m.answer(
+        "🎉 <b>TABRIKLAYMIZ! SIZ SOVRINLI O'YINGA MUVAFFAQIYATLI QO'SHILDINGIZ!</b> 🎮\n\n"
+        f"🏆 <b>Sovrin:</b> <b>{html.escape(gw['prize'])}</b>\n"
+        f"👥 <b>G'oliblar soni:</b> <b>{gw['winners_count']} kishi</b>\n"
+        f"🎫 <b>Sizning ishtirokchi raqamingiz:</b> <code>#{new_count}</code>\n\n"
+        "💡 <i>G'oliblar muddati tugashi bilanoq kanalimizda e'lon qilinadi. "
+        "Agar siz yutsangiz, botga kirib /start bosganingizda sovrin kodingiz taqdim etiladi! Omad!</i>",
+        reply_markup=MENU
+    )
+
+@dp.callback_query(F.data.startswith("gw_chk:"))
+async def gw_check_sub_callback(cb: types.CallbackQuery):
+    gw_id = int(cb.data.split(":")[1])
+    gw = q("SELECT * FROM channel_giveaways WHERE id=?", (gw_id,), one=True)
+    if not gw or gw["status"] != "active":
+        return await cb.answer("⚠️ Ushbu sovg'ali o'yin muddati yakunlangan!", show_alert=True)
+
+    cid = gw["channel_id"]
+    uid = cb.from_user.id
+
+    is_sub = True
+    try:
+        mem = await bot.get_chat_member(cid, uid)
+        if mem.status in ("left", "kicked"):
+            is_sub = False
+    except Exception:
+        pass
+
+    for r in q("SELECT chat FROM required"):
+        try:
+            mem2 = await bot.get_chat_member(r["chat"], uid)
+            if mem2.status in ("left", "kicked"):
+                is_sub = False
+        except Exception:
+            pass
+
+    if not is_sub:
+        return await cb.answer("⚠️ Hali barcha kanallarga a'zo bo'lmadingiz! Iltimos, barchasiga a'zo bo'ling.", show_alert=True)
+
+    now_iso = now_utc().isoformat()
+    q("INSERT OR IGNORE INTO giveaway_participants (giveaway_id, user_id, user_name, joined_at) VALUES (?, ?, ?, ?)",
+      (gw_id, uid, cb.from_user.full_name or "Ishtirokchi", now_iso), commit=True)
+
+    new_count = q("SELECT COUNT(*) as c FROM giveaway_participants WHERE giveaway_id=?", (gw_id,), one=True)["c"]
+
+    await cb.answer("✅ Obunangiz tasdiqlandi! Siz o'yinga qo'shildingiz!", show_alert=True)
+    try:
+        await cb.message.edit_text(
+            "🎉 <b>TABRIKLAYMIZ! SIZ SOVRINLI O'YINGA MUVAFFAQIYATLI QO'SHILDINGIZ!</b> 🎮\n\n"
+            f"🏆 <b>Sovrin:</b> <b>{html.escape(gw['prize'])}</b>\n"
+            f"👥 <b>G'oliblar soni:</b> <b>{gw['winners_count']} kishi</b>\n"
+            f"🎫 <b>Sizning ishtirokchi raqamingiz:</b> <code>#{new_count}</code>\n\n"
+            "💡 <i>G'oliblar kanalimizda e'lon qilinadi va sovrin bot orqali taqdim etiladi! Omad!</i>"
+        )
+    except Exception:
+        pass
+
+
+# ----------------- PROMO-KOD VA RAG'BATLANTIRISH ASOSIY MENYUSI -----------------
 
 @dp.message(F.chat.type == "private", F.text == "🎁 Promo-kod / Yutuq")
 @dp.message(F.chat.type == "private", Command("promo"))
-async def cmd_promo(m: types.Message, state: FSMContext):
-    # Agar buyruq bilan birga kod yozilgan bo'lsa: /promo CODEXXX
+async def cmd_promo_menu(m: types.Message, state: FSMContext):
+    await state.clear()
     parts = m.text.strip().split(maxsplit=1)
     if len(parts) > 1 and parts[1].strip():
         code = parts[1].strip()
         ok, res_msg = activate_user_promocode(m.from_user.id, code)
         return await m.answer(res_msg, reply_markup=MENU)
 
-    await state.set_state(UserPromo.code)
-    await m.answer(
-        "🎁 <b>PROMO-KOD / YUTUQNI FAOLLASHTIRISH</b>\n\n"
-        "Kanalimizdagi konkurslar, o'yinlar yoki admin tomonidan taqdim etilgan "
-        "<b>promo-kodni</b> shu yerga yozib yuboring:\n\n"
-        "<i>(Masalan: <code>START7</code>, <code>PUBG-UC</code>, <code>LUCKY2026</code>)</i>\n"
-        "❌ Bekor qilish: /cancel",
-        reply_markup=types.ReplyKeyboardRemove()
+    chs = q("SELECT COUNT(*) as c FROM channels WHERE owner_id=? AND active=1", (m.from_user.id,), one=True)
+    ch_c = chs["c"] if chs else 0
+
+    text = (
+        "🎁 <b>PROMO-KOD VA SOVRINLI O'YINLAR (RAG'BATLANTIRISH)</b>\n\n"
+        "Ushbu bo'lim orqali siz:\n"
+        "1. 🏆 <b>Kanalda Sovrinli O'yin (Giveaway) o'tkazish</b> — Kanalingiz a'zolarini faollashtirish uchun "
+        "<b>PUBG UC</b>, <b>Promo-kod</b> yoki <b>Pul yutuqlari</b> o'ynashingiz mumkin.\n"
+        "2. 🎁 <b>Promo-kodni faollashtirish</b> — Agar sizda sovg'a promo-kodi bo'lsa, uni kiritib sovriningizni olishingiz mumkin.\n\n"
+        f"📢 <b>Sizning faol kanallaringiz:</b> <b>{ch_c} ta</b>\n\n"
+        "Kerakli amalni tanlang 👇"
     )
+    kb = ik(
+        [("🏆 Yangi Sovrinli O'yin yaratish (Giveaway)", "gw_wz:start")],
+        [("🎁 Promo-kodni faollashtirish (Sovrin olish)", "user_promo:enter")],
+        [("📊 Faol o'yinlarim ro'yxati", "gw_wz:my_list")]
+    )
+    await m.answer(text, reply_markup=kb)
+
+@dp.callback_query(F.data == "user_promo:enter")
+async def user_promo_enter_callback(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(UserPromo.code)
+    await cb.message.answer(
+        "🎁 <b>PROMO-KODNI FAOLLASHTIRISH:</b>\n\n"
+        "Sizga taqdim etilgan maxsus promo-kodni shu yerga yozib yuboring:\n"
+        "<i>(Masalan: <code>START7</code>, <code>PUBG-UC</code>, <code>BONUS2026</code>)</i>\n\n"
+        "❌ Bekor qilish: /cancel"
+    )
+    await cb.answer()
 
 @dp.message(UserPromo.code)
 async def process_user_promo(m: types.Message, state: FSMContext):
@@ -4412,166 +4679,405 @@ async def process_user_promo(m: types.Message, state: FSMContext):
     await state.clear()
     await m.answer(res_msg, reply_markup=MENU)
 
-# ----------------- KANAL SOVG'ALI O'YINLARI (GIVEAWAY) -----------------
 
+# ----------------- SOVRINLI O'YIN (GIVEAWAY) YARATISH USTASI (WIZARD) -----------------
+
+@dp.callback_query(F.data == "gw_wz:start")
 @dp.message(Command("giveaway"), F.chat.type == "private")
-async def cmd_create_giveaway(m: types.Message, state: FSMContext):
-    """Admin yoki kanal egalari uchun kanalga rag'batlantiruvchi konkurs e'lon qilish"""
-    chs = q("SELECT * FROM channels WHERE owner_id=? AND active=1", (m.from_user.id,))
-    if not chs and m.from_user.id not in ADMIN_IDS:
-        return await m.answer("⚠️ Sovg'ali o'yin o'tkazish uchun avval «➕ Kanal ulash» orqali kanalingizni ulang.")
+async def gw_wizard_start(event: types.CallbackQuery | types.Message, state: FSMContext):
+    await state.clear()
+    uid = event.from_user.id
+    chs = q("SELECT * FROM channels WHERE owner_id=? AND active=1", (uid,))
+    if not chs and uid not in ADMIN_IDS:
+        msg = "⚠️ <b>Sovrinli o'yin o'tkazish uchun avval «➕ Kanal ulash» orqali kanalingizni ulang!</b>"
+        if isinstance(event, types.CallbackQuery):
+            return await event.answer(msg, show_alert=True)
+        return await event.answer(msg, reply_markup=MENU)
 
-    if m.from_user.id in ADMIN_IDS and not chs:
+    await state.set_state(GiveawayWizard.repeat_mode)
+    text = (
+        "🔄 <b>1-QADAM: Sovrinli o'yin takrorlansinmi yoki 1 martalikmi?</b>\n\n"
+        "• <b>1 martalik</b>: Faqat 1 marta o'tkaziladi va <b>1 kun (24 soat)</b> ichida yakunlanib, g'oliblar aniqlanadi.\n"
+        "• <b>Takroriy</b>: Belgilangan vaqtda (har kun yoki har hafta) avtomatik ravishda yangi sovrinli bosqich o'ynalib turadi.\n\n"
+        "Kerakli variantni tanlang 👇"
+    )
+    kb = ik(
+        [("1️⃣ 1 martalik (1 kunda tugaydi)", "gw_wz_rep:once")],
+        [("🔁 Takroriy (Har kun / Hafta)", "gw_wz_rep:repeat")]
+    )
+    if isinstance(event, types.CallbackQuery):
+        await event.message.answer(text, reply_markup=kb)
+        await event.answer()
+    else:
+        await event.answer(text, reply_markup=kb)
+
+@dp.callback_query(GiveawayWizard.repeat_mode, F.data.startswith("gw_wz_rep:"))
+async def gw_wz_repeat_chosen(cb: types.CallbackQuery, state: FSMContext):
+    rep_val = cb.data.split(":")[1]
+    if rep_val == "once":
+        await state.update_data(repeat_type="once", repeat_schedule="24_hours")
+        await state.set_state(GiveawayWizard.prize_type)
+        text = (
+            "🎁 <b>2-QADAM: Sovrin turini tanlang:</b>\n\n"
+            "Kanalingizda qanday mukofot o'ynamoqchisiz?\n\n"
+            "Keraklisini tanlang 👇"
+        )
+        kb = ik(
+            [("🎮 PUBG Mobile UC", "gw_wz_ptype:uc")],
+            [("🎟 Maxsus Promo-kod / Kupon", "gw_wz_ptype:promo")],
+            [("💰 Pul mukofoti (Payme / Uzcard)", "gw_wz_ptype:money")]
+        )
+        await cb.message.answer(text, reply_markup=kb)
+        await cb.answer()
+    else:
+        await state.update_data(repeat_type="repeat")
+        await state.set_state(GiveawayWizard.repeat_schedule)
+        text = (
+            "📅 <b>2-QADAM: Takrorlanish vaqtini tanlang:</b>\n\n"
+            "Sovrinli o'yin qaysi vaqtda takrorlanib kanalga chiqarilsin?\n\n"
+            "Variantlardan birini tanlang 👇"
+        )
+        kb = ik(
+            [("📅 Har kuni soat 20:00 da", "gw_wz_sch:Har kuni 20:00")],
+            [("📅 Har yakshanba 20:00 da", "gw_wz_sch:Har yakshanba 20:00")],
+            [("📅 Har juma 19:00 da", "gw_wz_sch:Har juma 19:00")],
+            [("⏱ Har 3 kunda bir marta", "gw_wz_sch:Har 3 kunda")]
+        )
+        await cb.message.answer(text, reply_markup=kb)
+        await cb.answer()
+
+@dp.callback_query(GiveawayWizard.repeat_schedule, F.data.startswith("gw_wz_sch:"))
+async def gw_wz_schedule_chosen(cb: types.CallbackQuery, state: FSMContext):
+    sch_val = cb.data.split(":", 1)[1]
+    await state.update_data(repeat_schedule=sch_val)
+    await state.set_state(GiveawayWizard.prize_type)
+    text = (
+        "🎁 <b>3-QADAM: Sovrin turini tanlang:</b>\n\n"
+        "Kanalingizda qanday mukofot o'ynamoqchisiz?\n\n"
+        "Keraklisini tanlang 👇"
+    )
+    kb = ik(
+        [("🎮 PUBG Mobile UC", "gw_wz_ptype:uc")],
+        [("🎟 Maxsus Promo-kod / Kupon", "gw_wz_ptype:promo")],
+        [("💰 Pul mukofoti (Payme / Uzcard)", "gw_wz_ptype:money")]
+    )
+    await cb.message.answer(text, reply_markup=kb)
+    await cb.answer()
+
+@dp.callback_query(GiveawayWizard.prize_type, F.data.startswith("gw_wz_ptype:"))
+async def gw_wz_ptype_chosen(cb: types.CallbackQuery, state: FSMContext):
+    ptype = cb.data.split(":")[1]
+    await state.update_data(prize_type=ptype)
+    await state.set_state(GiveawayWizard.prize_amount)
+
+    if ptype == "uc":
+        await cb.message.answer(
+            "🎮 <b>SOVRIN MIQDORI (PUBG UC):</b>\n\n"
+            "Necha UC sovrin qilib o'ynalmoqda?\n"
+            "<i>Masalan: <b>60 UC</b>, <b>325 UC</b>, <b>660 UC</b> yoki <b>1800 UC</b> deb yozib yuboring:</i>\n\n"
+            "❌ Bekor qilish: /cancel"
+        )
+    elif ptype == "promo":
+        await cb.message.answer(
+            "🎟 <b>PROMO-KOD NOMI VA SOVG'ASI:</b>\n\n"
+            "Sovrin nomini kiriting:\n"
+            "<i>Masalan: <b>VIP-CHIPTASI (1 oylik bepul kirish)</b> yoki <b>50% chegirma kodi</b>:</i>\n\n"
+            "❌ Bekor qilish: /cancel"
+        )
+    else:
+        await cb.message.answer(
+            "💰 <b>PUL MUKOFOTI SUMMASI:</b>\n\n"
+            "Yutuq summasini kiriting:\n"
+            "<i>Masalan: <b>50 000 so'm</b> yoki <b>100 000 so'm Payme/Uzcard</b>:</i>\n\n"
+            "❌ Bekor qilish: /cancel"
+        )
+    await cb.answer()
+
+@dp.message(GiveawayWizard.prize_amount)
+async def gw_wz_amount_got(m: types.Message, state: FSMContext):
+    amount = m.text.strip()
+    if amount.casefold() in {"cancel", "/cancel", "bekor"}:
+        await state.clear()
+        return await m.answer("Bekor qilindi.", reply_markup=MENU)
+
+    await state.update_data(prize_amount=amount)
+    await state.set_state(GiveawayWizard.secret_code)
+
+    await m.answer(
+        "🔑 <b>G'OLIBGA TOPSHIRILADIGAN MAXFIY KOD (UC PROMOSI / KUPON):</b>\n\n"
+        "G'olib botga kirib /start bosganda unga taqdim etiladigan <b>maxfiy UC promo-kodini / PIN-kodni</b> kiriting:\n\n"
+        "🔒 <i>Xavfsizlik: Ushbu kod kanalga chiqarilmaydi! Faqat o'yin yakunlanib, haqiqiy g'olib aniqlangach, "
+        "unga bot orqali shaxsiy xabar qilib beriladi.</i>\n\n"
+        "<i>Masalan: <code>PUBG-UC60-84729104</code> yoki <code>PROMO-SECRET-2026</code></i>\n"
+        "❌ Bekor qilish: /cancel"
+    )
+
+@dp.message(GiveawayWizard.secret_code)
+async def gw_wz_code_got(m: types.Message, state: FSMContext):
+    code_val = m.text.strip()
+    if code_val.casefold() in {"cancel", "/cancel", "bekor"}:
+        await state.clear()
+        return await m.answer("Bekor qilindi.", reply_markup=MENU)
+
+    await state.update_data(secret_code=code_val)
+    await state.set_state(GiveawayWizard.site_url)
+
+    text = (
+        "🌐 <b>Ushbu kod qaysi sayt / platformaga kiritiladi?</b>\n\n"
+        "G'olib ushbu UC yoki promokodni qayerga kirib faollashtirishi kerakligini tanlang "
+        "yoki o'z saytingiz manzilini yozib yuboring:\n\n"
+        "Tanlang yoki yozing 👇"
+    )
+    kb = ik(
+        [("🌐 Midasbuy (PUBG Mobile)", "gw_wz_site:https://www.midasbuy.com")],
+        [("🌐 Google Play Store", "gw_wz_site:Google Play Store")],
+        [("🤖 Telegram Bot ichida", "gw_wz_site:Telegram Bot ichida")]
+    )
+    await m.answer(text, reply_markup=kb)
+
+@dp.callback_query(GiveawayWizard.site_url, F.data.startswith("gw_wz_site:"))
+async def gw_wz_site_chosen(cb: types.CallbackQuery, state: FSMContext):
+    site = cb.data.split(":", 1)[1]
+    await state.update_data(site_url=site)
+    await ask_winners_count(cb.message, state)
+    await cb.answer()
+
+@dp.message(GiveawayWizard.site_url)
+async def gw_wz_site_typed(m: types.Message, state: FSMContext):
+    site = m.text.strip()
+    if site.casefold() in {"cancel", "/cancel", "bekor"}:
+        await state.clear()
+        return await m.answer("Bekor qilindi.", reply_markup=MENU)
+
+    await state.update_data(site_url=site)
+    await ask_winners_count(m, state)
+
+async def ask_winners_count(m: types.Message, state: FSMContext):
+    await state.set_state(GiveawayWizard.winners_count)
+    text = (
+        "👥 <b>Sovrin necha kishilik? (Nechta g'olib tanlansin?):</b>\n\n"
+        "Tasodifiy RNG tizimi orqali nechta omadli g'olib tanlanishini belgilang:\n\n"
+        "Tanlang yoki raqam qilib yozing 👇"
+    )
+    kb = ik(
+        [("🥇 1 kishi", "gw_wz_win:1"), ("🥈 3 kishi", "gw_wz_win:3"), ("🥉 5 kishi", "gw_wz_win:5")]
+    )
+    await m.answer(text, reply_markup=kb)
+
+@dp.callback_query(GiveawayWizard.winners_count, F.data.startswith("gw_wz_win:"))
+async def gw_wz_win_chosen(cb: types.CallbackQuery, state: FSMContext):
+    w_count = int(cb.data.split(":")[1])
+    await state.update_data(winners_count=w_count)
+    await ask_channel_select(cb.message, cb.from_user.id, state)
+    await cb.answer()
+
+@dp.message(GiveawayWizard.winners_count)
+async def gw_wz_win_typed(m: types.Message, state: FSMContext):
+    try:
+        w_count = max(1, int(m.text.strip()))
+    except Exception:
+        w_count = 1
+    await state.update_data(winners_count=w_count)
+    await ask_channel_select(m, m.from_user.id, state)
+
+async def ask_channel_select(m: types.Message, uid: int, state: FSMContext):
+    await state.set_state(GiveawayWizard.channel_id)
+    chs = q("SELECT * FROM channels WHERE owner_id=? AND active=1", (uid,))
+    if not chs and uid in ADMIN_IDS:
         chs = q("SELECT * FROM channels WHERE active=1 LIMIT 10")
 
-    buttons = [[(f"📢 {html.escape(c['title'])}", f"gw_start:{c['channel_id']}")] for c in chs]
+    if not chs:
+        await state.clear()
+        return await m.answer("⚠️ Botga ulangan faol kanallar topilmadi. Avval «➕ Kanal ulash» orqali kanal ulang.", reply_markup=MENU)
+
+    buttons = [[(f"📢 {html.escape(c['title'])}", f"gw_wz_chan:{c['channel_id']}")] for c in chs]
     await m.answer(
-        "🎁 <b>Qaysi kanalingizda sovg'ali o'yin (Giveaway) o'tkazmoqchisiz?</b>\n"
+        "📢 <b>OXIRGI QADAM: Qaysi kanalingizga sovrinli o'yin chiqarilsin?</b>\n\n"
         "Kerakli kanalni tanlang 👇",
         reply_markup=ik(*buttons)
     )
 
-@dp.callback_query(F.data.startswith("gw_start:"))
-async def gw_start_callback(cb: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(GiveawayWizard.channel_id, F.data.startswith("gw_wz_chan:"))
+async def gw_wz_channel_chosen(cb: types.CallbackQuery, state: FSMContext):
     cid = int(cb.data.split(":")[1])
-    await state.set_state(CreateGiveaway.prize)
-    await state.update_data(channel_id=cid)
-    await cb.message.answer(
-        "🏆 <b>Sovg'a (yutuq) nomini kiriting:</b>\n\n"
-        "<i>Masalan: <b>60 PUBG UC</b>, <b>20 000 so'm Payme</b> yoki <b>1 oylik PRO obuna</b></i>\n"
-        "❌ Bekor qilish: /cancel"
-    )
-    await cb.answer()
-
-@dp.message(CreateGiveaway.prize)
-async def gw_prize_entered(m: types.Message, state: FSMContext):
-    prize = m.text.strip()
-    if prize.casefold() in {"cancel", "/cancel", "bekor"}:
-        await state.clear()
-        return await m.answer("Bekor qilindi.", reply_markup=MENU)
-
+    uid = cb.from_user.id
     d = await state.get_data()
-    cid = d["channel_id"]
     await state.clear()
 
-    # Bazada konkurs yaratish
+    prize = d.get("prize_amount", "Sovrin")
+    prize_type = d.get("prize_type", "uc")
+    secret_code = d.get("secret_code", "")
+    site_url = d.get("site_url", "https://www.midasbuy.com")
+    winners_count = d.get("winners_count", 1)
+    repeat_type = d.get("repeat_type", "once")
+    repeat_schedule = d.get("repeat_schedule", "")
+
+    now_dt = now_utc()
+    ends_dt = now_dt + timedelta(days=1)
+    ends_iso = ends_dt.isoformat()
+    now_iso = now_dt.isoformat()
+
     cur = db.execute(
-        "INSERT INTO channel_giveaways (channel_id, message_id, prize, winners_count, status, created_at) "
-        "VALUES (?, 0, ?, 1, 'active', ?)",
-        (cid, prize, now_utc().isoformat())
+        "INSERT INTO channel_giveaways (owner_id, channel_id, message_id, prize, prize_type, secret_code, site_url, winners_count, repeat_type, repeat_time, status, ends_at, created_at) "
+        "VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+        (uid, cid, prize, prize_type, secret_code, site_url, winners_count, repeat_type, repeat_schedule, ends_iso, now_iso)
     )
     db.commit()
     gw_id = cur.lastrowid
 
-    # Kanalga chiroyli sovg'ali post chiqarish
     bot_info = await bot.me()
-    gw_post = (
-        f"🎁 <b>KANAL OBUNACHILARI UCHUN MAXSUS SOVG'ALI O'YIN!</b> 🎮\n\n"
-        f"Do'stim, bizning faol obunachilarimiz uchun navbatdagi qiziqarli konkurs!\n\n"
+    join_url = f"https://t.me/{bot_info.username}?start=gw_{gw_id}"
+
+    ends_local = ends_dt.astimezone(TZ)
+    ends_str = ends_local.strftime("%d.%m.%Y soat %H:%M")
+
+    post_text = (
+        "🎁 <b>KANAL OBUNACHILARI UCHUN MAXSUS SOVG'ALI O'YIN!</b> 🎮\n\n"
+        "Do'stlar, faol obunachilarimiz uchun navbatdagi ajoyib konkurs!\n\n"
         f"🏆 <b>Sovrin:</b> <b>{html.escape(prize)}</b>\n"
-        f"👥 <b>Ishtirokchilar:</b> <code>0 nafar</code>\n"
-        f"🎯 <b>Shart:</b> Kanalimizga obuna bo'ling va pastdagi tugmani bosing!\n\n"
-        f"💡 <i>G'olib tasodifiy, adolatli RNG tizimi orqali aniqlanadi va kanalga e'lon qilinadi!</i>"
+        f"👥 <b>G'oliblar soni:</b> <b>{winners_count} nafar</b>\n"
+        f"🌐 <b>Faollashtirish platformasi:</b> {html.escape(site_url)}\n"
+        f"⏳ <b>Yakunlanish vaqti:</b> <code>{ends_str}</code> (1 kun ichida)\n\n"
+        "🎯 <b>Ishtirok etish shartlari:</b>\n"
+        "1. Kanalimizga to'liq a'zo bo'ling.\n"
+        "2. Pastdagi <b>«🎁 Sovringa qo'shilish»</b> tugmasini bosing va botimizga kiring!\n\n"
+        "💡 <i>G'oliblar muddat tugashi bilan avtomatik, adolatli RNG tizimi orqali aniqlanadi "
+        "va kanalimizda e'lon qilinadi. G'oliblarga sovrin kodi bot orqali beriladi. Omad! 🍀</i>"
     )
-    btn = ik([("🎯 Ishtirok etish (0)", f"gw_join:{gw_id}")])
+    btn = ik([("🎁 Sovringa qo'shilish", None, join_url)])
 
     try:
-        sent_m = await bot.send_message(cid, gw_post, reply_markup=btn)
+        sent_m = await bot.send_message(cid, post_text, reply_markup=btn)
         q("UPDATE channel_giveaways SET message_id=? WHERE id=?", (sent_m.message_id, gw_id), commit=True)
-        await m.answer(
-            f"✅ <b>Sovg'ali o'yin kanalga muvaffaqiyatli chiqarildi!</b>\n\n"
-            f"Sovrin: <b>{html.escape(prize)}</b>\n"
-            f"Ishtirokchilar yig'ilgach, g'olibni aniqlash uchun: <code>/finish_giveaway {gw_id}</code>",
+        ch_row = q("SELECT title FROM channels WHERE channel_id=?", (cid,), one=True)
+        ch_title = ch_row["title"] if ch_row else "Kanalingiz"
+
+        await cb.message.answer(
+            "✅ <b>SOVRINLI O'YIN KANALGA MUVAFFAQIYATLI CHIQARILDI!</b> 🚀\n\n"
+            f"📢 <b>Kanal:</b> <b>{html.escape(ch_title)}</b>\n"
+            f"🏆 <b>Sovrin:</b> <b>{html.escape(prize)}</b>\n"
+            f"👥 <b>G'oliblar soni:</b> <b>{winners_count} nafar</b>\n"
+            f"⏳ <b>Yakunlanish vaqti:</b> <code>{ends_str}</code> (1 kun ichida)\n"
+            f"🔗 <b>Qatnashish havolasi:</b> <code>{join_url}</code>\n\n"
+            "<i>1 kundan so'ng bot avtomatik ravishda tasodifiy g'oliblarni aniqlaydi, "
+            "kanalga e'lon qiladi va g'olib /start bosganda sovrin kodi topshiriladi!</i>",
             reply_markup=MENU
         )
     except Exception as e_send:
-        await m.answer(f"❌ Kanalga post chiqarishda xatolik: {e_send}", reply_markup=MENU)
+        await cb.message.answer(f"❌ Kanalga post yuborishda xatolik yuz berdi: {e_send}", reply_markup=MENU)
+    await cb.answer()
 
-@dp.callback_query(F.data.startswith("gw_join:"))
-async def gw_join_callback(cb: types.CallbackQuery):
-    gw_id = int(cb.data.split(":")[1])
-    gw = q("SELECT * FROM channel_giveaways WHERE id=?", (gw_id,), one=True)
-    if not gw or gw["status"] != "active":
-        return await cb.answer("⚠️ Ushbu sovg'ali o'yin yakunlangan!", show_alert=True)
-
-    cid = gw["channel_id"]
+@dp.callback_query(F.data == "gw_wz:my_list")
+async def gw_my_list_callback(cb: types.CallbackQuery):
     uid = cb.from_user.id
+    rows = q("SELECT * FROM channel_giveaways WHERE owner_id=? ORDER BY id DESC LIMIT 10", (uid,))
+    if not rows and uid in ADMIN_IDS:
+        rows = q("SELECT * FROM channel_giveaways ORDER BY id DESC LIMIT 10")
 
-    # Obunani tekshirish
+    if not rows:
+        return await cb.answer("Sizda hali sovrinli o'yinlar mavjud emas.", show_alert=True)
+
+    txt = "📊 <b>SIZNING SOVRINLI O'YINLARINGIZ (GIVEAWAY):</b>\n\n"
+    for r in rows:
+        p_count = q("SELECT COUNT(*) as c FROM giveaway_participants WHERE giveaway_id=?", (r["id"],), one=True)["c"]
+        st = "🟢 Faol" if r["status"] == "active" else "🏁 Yakunlangan"
+        txt += f"🎁 <b>#{r['id']} — {html.escape(r['prize'])}</b>\n"
+        txt += f"Holat: {st} | Ishtirokchilar: <b>{p_count} nafar</b>\n\n"
+
+    await cb.message.answer(txt, reply_markup=MENU)
+    await cb.answer()
+
+
+# ----------------- FONDA ISHLOVCHI AVTOMATIK YAKUNLASH (BACKGROUND WORKER) -----------------
+
+async def auto_process_giveaways():
+    """Har 30 soniyada muddati tugagan faol sovrinli o'yinlarni avtomatik aniqlab yakunlaydi"""
     try:
-        mem = await bot.get_chat_member(cid, uid)
-        if mem.status in ("left", "kicked"):
-            return await cb.answer("⚠️ Ishtirok etish uchun avval kanalimizga obuna bo'lishingiz kerak!", show_alert=True)
-    except Exception:
-        pass
+        now_s = now_utc().isoformat()
+        due_gws = q("SELECT * FROM channel_giveaways WHERE status='active' AND ends_at IS NOT NULL AND ends_at!='' AND ends_at<=?", (now_s,))
+        for gw in due_gws:
+            gw_id = gw["id"]
+            cid = gw["channel_id"]
+            prize = gw["prize"]
+            w_count = gw["winners_count"] or 1
+            secret_code = gw.get("secret_code", "")
+            site_url = gw.get("site_url", "https://www.midasbuy.com")
 
-    # Allaqachon qatnashyaptimi?
-    already = q("SELECT 1 FROM giveaway_participants WHERE giveaway_id=? AND user_id=?", (gw_id, uid), one=True)
-    if already:
-        return await cb.answer("✅ Siz allaqachon ushbu konkursda ishtirok etyapsiz! Omad yor bo'lsin!", show_alert=True)
+            participants = q("SELECT * FROM giveaway_participants WHERE giveaway_id=?", (gw_id,))
+            bot_info = await bot.me()
 
-    # Qo'shish
-    q("INSERT INTO giveaway_participants (giveaway_id, user_id, user_name, joined_at) VALUES (?, ?, ?, ?)",
-      (gw_id, uid, cb.from_user.full_name or "Ishtirokchi", now_utc().isoformat()), commit=True)
+            if not participants:
+                q("UPDATE channel_giveaways SET status='finished' WHERE id=?", (gw_id,), commit=True)
+                try:
+                    await bot.send_message(
+                        cid,
+                        f"⏳ <b>«{html.escape(prize)}» SOVG'ALI O'YIN MUDDATI TUGADI!</b>\n\n"
+                        "Afsuski, ushbu o'yinda hech kim qatnashmadi. Keyingi ajoyib o'yinlarimizni kuzatib boring! 🎮"
+                    )
+                except Exception:
+                    pass
+                continue
 
-    count = q("SELECT COUNT(*) as c FROM giveaway_participants WHERE giveaway_id=?", (gw_id,), one=True)["c"]
-    await cb.answer("🎉 Siz muvaffaqiyatli ro'yxatga olindingiz! G'olib yaqinda e'lon qilinadi.", show_alert=True)
+            k = min(w_count, len(participants))
+            winners = random.sample(participants, k)
 
-    # Tugmadagi sonni yangilash
-    try:
-        new_btn = ik([("🎯 Ishtirok etish (" + str(count) + ")", f"gw_join:{gw_id}")])
-        await cb.message.edit_reply_markup(reply_markup=new_btn)
-    except Exception:
-        pass
+            winners_text = ""
+            for i, w in enumerate(winners, 1):
+                w_uid = w["user_id"]
+                w_name = w["user_name"] or "G'olib"
+                q("UPDATE giveaway_participants SET is_winner=1 WHERE giveaway_id=? AND user_id=?", (gw_id, w_uid), commit=True)
+                winners_text += f"{i}. <a href=\"tg://user?id={w_uid}\">{html.escape(w_name)}</a>\n"
 
-@dp.message(Command("finish_giveaway"), F.chat.type == "private")
-async def cmd_finish_giveaway(m: types.Message):
-    """Konkursni yakunlash va adolatli g'olibni tasodifiy tanlash"""
-    parts = m.text.strip().split()
-    if len(parts) < 2:
-        return await m.answer("Foydalanish: <code>/finish_giveaway [giveaway_id]</code>")
+                try:
+                    await bot.send_message(
+                        w_uid,
+                        f"🎉 <b>TABRIKLAYMIZ! SIZ KANALDA SOVRIN YUTIB OLDINGIZ!</b> 🏆\n\n"
+                        f"Yutuq: <b>{html.escape(prize)}</b>\n\n"
+                        f"🎁 Sovriningizni (kod va yo'riqnomani) olish uchun pastdagi tugmani bosing yoki botimizga <b>/start</b> yozing!",
+                        reply_markup=ik([("🎁 Sovrinimni olish", None, f"https://t.me/{bot_info.username}?start=gw_{gw_id}")])
+                    )
+                except Exception:
+                    pass
 
-    gw_id = int(parts[1])
-    gw = q("SELECT * FROM channel_giveaways WHERE id=?", (gw_id,), one=True)
-    if not gw:
-        return await m.answer("❌ Konkurs topilmadi.")
+            q("UPDATE channel_giveaways SET status='finished' WHERE id=?", (gw_id,), commit=True)
 
-    participants = q("SELECT * FROM giveaway_participants WHERE giveaway_id=?", (gw_id,))
-    if not participants:
-        return await m.answer("⚠️ Konkursda hali hech kim qatnashmadi.")
+            congrats_post = (
+                f"🎉 <b>DIQQAT! SOVRINLI O'YIN G'OLIBLARI ANIQLANDI!</b> 🏆\n\n"
+                f"Bugungi <b>{html.escape(prize)}</b> sovrini g'oliblari:\n\n"
+                f"{winners_text}\n"
+                f"👉 <b>DIQQAT G'OLIBLAR:</b> Botimizga (@{bot_info.username}) kirib <b>/start</b> bossangiz, "
+                "bot sizga sovriningizni (maxfiy kod va sayt yo'riqnomasini) avtomatik taqdim etadi! 🎁"
+            )
+            try:
+                await bot.send_message(cid, congrats_post)
+            except Exception as e_ch:
+                logging.warning(f"G'oliblar postini kanalga yuborishda xato: {e_ch}")
 
-    winner = random.choice(participants)
-    w_name = winner["user_name"]
-    w_uid = winner["user_id"]
-    prize = gw["prize"]
-    cid = gw["channel_id"]
+            if gw.get("repeat_type") == "repeat":
+                try:
+                    new_now = now_utc()
+                    new_ends = (new_now + timedelta(days=1)).isoformat()
+                    cur_new = db.execute(
+                        "INSERT INTO channel_giveaways (owner_id, channel_id, message_id, prize, prize_type, secret_code, site_url, winners_count, repeat_type, repeat_time, status, ends_at, created_at) "
+                        "VALUES (?, ?, 0, ?, ?, ?, ?, ?, 'repeat', ?, 'active', ?, ?)",
+                        (gw["owner_id"], cid, prize, gw.get("prize_type", "uc"), secret_code, site_url, w_count, gw.get("repeat_time", ""), new_ends, new_now.isoformat())
+                    )
+                    db.commit()
+                    new_gw_id = cur_new.lastrowid
+                    new_join_url = f"https://t.me/{bot_info.username}?start=gw_{new_gw_id}"
+                    new_post = (
+                        "🎁 <b>YANGI BOSQICH: KANAL OBUNACHILARI UCHUN SOVG'ALI O'YIN!</b> 🎮\n\n"
+                        f"🏆 <b>Sovrin:</b> <b>{html.escape(prize)}</b>\n"
+                        f"👥 <b>G'oliblar soni:</b> <b>{w_count} nafar</b>\n\n"
+                        "🎯 <b>Ishtirok etish uchun</b> pastdagi tugmani bosing va botga kiring! 👇"
+                    )
+                    s_m = await bot.send_message(cid, new_post, reply_markup=ik([("🎁 Sovringa qo'shilish", None, new_join_url)]))
+                    q("UPDATE channel_giveaways SET message_id=? WHERE id=?", (s_m.message_id, new_gw_id), commit=True)
+                except Exception as e_rep:
+                    logging.warning(f"Takroriy giveaway yangilashda xato: {e_rep}")
+    except Exception as e_loop:
+        logging.warning(f"auto_process_giveaways xatosi: {e_loop}")
 
-    q("UPDATE channel_giveaways SET status='finished' WHERE id=?", (gw_id,), commit=True)
-
-    # Kanalga e'lon qilish
-    congrats_post = (
-        f"🏆 <b>SOVG'ALI O'YIN G'OLIBI ANIQLANDI!</b> 🎉\n\n"
-        f"Tasodifiy RNG tanlovi natijasida bugungi <b>{html.escape(prize)}</b> sovrini egasi:\n\n"
-        f"🥇 <b>G'olib:</b> <a href=\"tg://user?id={w_uid}\">{html.escape(w_name)}</a>\n\n"
-        f"🎉 <i>G'olibni samimiy tabriklaymiz! Sovg'ani qabul qilib olish uchun botimizga kiring yoki adminga yozing!</i>"
-    )
-    try:
-        await bot.send_message(cid, congrats_post)
-    except Exception as e_send:
-        logging.warning(f"G'olibni kanalga e'lon qilishda xatolik: {e_send}")
-
-    # G'olibning o'ziga ham shaxsiy xabar
-    try:
-        await bot.send_message(
-            w_uid,
-            f"🎉 <b>TABRIKLAYMIZ! SIZ KANALDA SOVG'A YUTIB OLDINGIZ!</b> 🏆\n\n"
-            f"Yutuq: <b>{html.escape(prize)}</b>\n"
-            f"Sovg'angizni olish uchun adminga murojaat qiling!"
-        )
-    except Exception:
-        pass
-
-    await m.answer(f"✅ G'olib aniqlandi: <b>{html.escape(w_name)}</b> (ID: {w_uid}) va kanalga e'lon qilindi!", reply_markup=MENU)
 
 # ----------------- ADMIN PANEL: PROMO-KOD YARATISH -----------------
 
