@@ -1,8 +1,12 @@
 .env
-bot.db
+*.db*
+bot.db*
 channels_backup.json
+backup_*.json
+user_backup_*.json
 __pycache__/
 *.pyc
 .vscode/
 temp_backups/
 *.log
+scratch/
