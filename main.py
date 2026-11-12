@@ -850,7 +850,11 @@ def generate_full_backup_data() -> dict:
     }
     for t in tables:
         try:
-            rows = q(f"SELECT * FROM {t}")
+            # recent_posts va chat_insights kabi og'ir jadvallardan faqat so'nggi ma'lumotlarni olish
+            if t in ("recent_posts", "chat_insights"):
+                rows = q(f"SELECT * FROM {t} ORDER BY rowid DESC LIMIT 200")
+            else:
+                rows = q(f"SELECT * FROM {t}")
             backup["tables"][t] = [dict(r) for r in rows]
         except Exception as e_t:
             logging.warning(f"Backup olishda jadval ({t}) xatosi: {e_t}")
@@ -935,7 +939,7 @@ def restore_database_from_file(filepath: str) -> tuple[bool, str]:
                         r.get("bans", 0), r.get("detailed_prompt", ""), r.get("custom_hours", ""),
                         r.get("polls_sent", 0), r.get("current_topic", ""), r.get("arc_day", 1),
                         r.get("arc_total_days", 3), r.get("last_cliffhanger", ""), r.get("created_at", "")
-                    ), commit=True)
+                    ), commit=False)
                     ch_count += 1
                 except Exception as e_ch:
                     logging.warning(f"Kanal tiklash xatosi: {e_ch}")
@@ -954,7 +958,7 @@ def restore_database_from_file(filepath: str) -> tuple[bool, str]:
                     """, (
                         u.get("user_id"), u.get("username"), u.get("full_name"),
                         u.get("plan"), u.get("expires_at"), u.get("banned", 0), u.get("joined_at")
-                    ), commit=True)
+                    ), commit=False)
                     u_count += 1
                 except Exception as e_u:
                     logging.warning(f"Foydalanuvchi tiklash xatosi: {e_u}")
@@ -972,7 +976,7 @@ def restore_database_from_file(filepath: str) -> tuple[bool, str]:
                     """, (
                         s.get("user_id"), s.get("plan_name", "start"), s.get("expires_at"),
                         s.get("daily_posts_count", 0), s.get("last_post_date"), s.get("created_at")
-                    ), commit=True)
+                    ), commit=False)
                     sub_count += 1
                 except Exception as e_s:
                     logging.warning(f"Obuna tiklash xatosi: {e_s}")
@@ -982,7 +986,7 @@ def restore_database_from_file(filepath: str) -> tuple[bool, str]:
                 try:
                     q("""INSERT INTO settings (key, value) VALUES (?,?)
                          ON CONFLICT(key) DO UPDATE SET value=excluded.value
-                    """, (st.get("key"), st.get("value")), commit=True)
+                    """, (st.get("key"), st.get("value")), commit=False)
                     st_count += 1
                 except Exception:
                     pass
@@ -990,9 +994,12 @@ def restore_database_from_file(filepath: str) -> tuple[bool, str]:
             # Majburiy kanallar
             for req in tables.get("required", []):
                 try:
-                    q("INSERT OR IGNORE INTO required (chat) VALUES (?)", (req.get("chat"),), commit=True)
+                    q("INSERT OR IGNORE INTO required (chat) VALUES (?)", (req.get("chat"),), commit=False)
                 except Exception:
                     pass
+
+            # Barcha jadvallarni bitta tranzaksiyada tezkor commit qilish (100x tezlashadi)
+            db.commit()
 
         # 2. Qadimgi ro'yxat shaklidagi zaxira formati
         elif isinstance(data, list):
@@ -1018,7 +1025,7 @@ def restore_database_from_file(filepath: str) -> tuple[bool, str]:
                         r.get("bans", 0), r.get("detailed_prompt", ""), r.get("custom_hours", ""),
                         r.get("polls_sent", 0), r.get("current_topic", ""), r.get("arc_day", 1),
                         r.get("arc_total_days", 3), r.get("last_cliffhanger", ""), r.get("created_at", "")
-                    ), commit=True)
+                    ), commit=False)
                     ch_count += 1
                 except Exception as e_old_ch:
                     logging.warning(f"Kanal tiklash xatosi: {e_old_ch}")
@@ -1072,7 +1079,7 @@ def restore_database_from_file(filepath: str) -> tuple[bool, str]:
                     """, (
                         u.get("user_id"), u.get("username"), u.get("full_name"),
                         u.get("plan"), u.get("expires_at"), u.get("banned", 0), u.get("joined_at")
-                    ), commit=True)
+                    ), commit=False)
                     u_count += 1
             except Exception:
                 pass
@@ -1089,7 +1096,7 @@ def restore_database_from_file(filepath: str) -> tuple[bool, str]:
                     """, (
                         s.get("user_id"), s.get("plan_name", "start"), s.get("expires_at"),
                         s.get("daily_posts_count", 0), s.get("last_post_date"), s.get("created_at")
-                    ), commit=True)
+                    ), commit=False)
                     sub_count += 1
             except Exception:
                 pass
@@ -1100,7 +1107,7 @@ def restore_database_from_file(filepath: str) -> tuple[bool, str]:
                     st = dict(r)
                     q("""INSERT INTO settings (key, value) VALUES (?,?)
                          ON CONFLICT(key) DO UPDATE SET value=excluded.value
-                    """, (st.get("key"), st.get("value")), commit=True)
+                    """, (st.get("key"), st.get("value")), commit=False)
                     st_count += 1
             except Exception:
                 pass
@@ -1247,6 +1254,7 @@ def restore_user_backup(uid: int, json_data: dict) -> tuple[bool, str]:
           ), commit=True)
         restored_count += 1
         
+    db.commit()
     auto_backup_channels()
     return True, f"✅ <b>Shaxsiy zaxirangiz muvaffaqiyatli tiklandi!</b>\n\nTiklandi: <b>{restored_count} ta</b> kanal va ularning barcha shaxsiy sozlamalari."
 
@@ -2304,14 +2312,14 @@ def generate_niche_adaptive_post_and_poll(c, theme=None):
         }
         
         poll_q_list = [
-            "Kanalimizda navbatdagi amaliy dars qaysi mavzuda bo'lsin? 🚀",
-            "Botingiz yoki veb-saytingizni bepul xostingga qo'yganmisiz? 🌐",
-            "Siz ko'proq qaysi yo'nalishga qiziqasiz? 💻"
+            "Qaysi biri osonroq? 💻",
+            "Loyihang bormi? 🚀",
+            "Eng yaxshi dasturlash tili? ⚡️"
         ]
         poll_opts_list = [
-            ["Telegram botlar va Python 🤖", "Web-saytlar va Frontend 💻", "Sun'iy intellekt (AI) integratsiyasi ⚡️", "Real keyslar va sotish sirlari 💡"],
-            ["Ha, Render/PythonAnywhere ishlataman ✅", "Yo'q, hali bilmayman 🤔", "Kompyuterimda ishlaydi 💻", "Tekin xosting qo'llanmasi kerak 📝"],
-            ["Backend va botlar ⚙️", "Frontend va saytlar 🎨", "AI va Data Science 🧠", "IT loyihalarni sotish va biznes 💰"]
+            ["Frontend (Dizayn) 🎨", "Backend (Mantiq) ⚙️", "Ikkalasi ham qiyin 😂"],
+            ["Ha, ishlayapman 🔥", "Rejada bor 💡", "Hali boshlamadim 🤔"],
+            ["Python 🐍", "JavaScript 🌐", "C++ / Java ⚡️"]
         ]
 
     # 3. Biznes / Startap / Savdo
@@ -2366,14 +2374,14 @@ def generate_niche_adaptive_post_and_poll(c, theme=None):
         }
         
         poll_q_list = [
-            "Biznes yoki startap boshlashda siz uchun eng katta to'siq nima? 💡",
-            "Mijozlarni jalb qilishda eng samarali usul qaysi deb o'ylaysiz? 📢",
-            "Shaxsiy loyihangizni qachon ishga tushirmoqchisiz? 🚀"
+            "Biznesda eng muhimi nima? 💡",
+            "Mijoz qayerdan topiladi? 📢",
+            "Loyihang bormi? 🚀"
         ]
         poll_opts_list = [
-            ["Boshlang'ich kapital topish 💰", "Mijozlarni jalb qilish (Marketing) 📢", "To'g'ri g'oya tanlash 🎯", "Jamoa va intizom ⏳"],
-            ["Telegram va ijtimoiy tarmoqlar 📱", "Tavsiyalar (Sarafan marketing) 🤝", "Target va to'g'ridan-to'g'ri reklama 🎯", "Shaxsiy brend va blog yuritish ✨"],
-            ["Hozirda faol ishlayapman 🔥", "Shu oy ichida boshlayman 🚀", "Hali rejalashtiryapman 🤔", "G'oya qidiryapman 💡"]
+            ["Mijoz topish 📢", "Katta pul 💰", "Yaxshi jamoa 🤝"],
+            ["Telegram tarmoqlari 📱", "Tavsiyalar (Sarafan) 🤝", "Reklama / Target 🎯"],
+            ["Ha, faol ishlayapman 🔥", "Rejalashtiryapman 💡", "G'oya qidiryapman 🤔"]
         ]
 
     # 4. Gaming / PUBG / Kibersport
@@ -2443,16 +2451,16 @@ def generate_niche_adaptive_post_and_poll(c, theme=None):
         }
         
         poll_q_list = [
-            "Sen PUBG Mobile'da qaysi qurilmada o'ynaysan? 📱",
-            "Yaqin masofada (Close Combat) sen uchun qaysi qurol eng kuchli? 💥",
-            "Sening PUBG dagi hozirgi K/D ko'rsatkiching qancha? 📊",
-            "Sen ko'proq qaysi xaritada o'ynaysan? 🗺"
+            "Close combatda eng zo'ri? 💥",
+            "Sening o'yin uslubing? 🎮",
+            "Qaysi xaritani yoqtirasan? 🗺",
+            "Qurilmang nima? 📱"
         ]
         poll_opts_list = [
-            ["Telefon (Android / iPhone) 📱", "iPad / Planshet 📟", "PC (Emulyator) 🖥", "Hali o'ynamayman 👀"],
-            ["DBS / Shotgun 🔥", "M416 (Stabil sprey) 🎯", "UZI / Vector (Tezkor otish) ⚡️", "AKM / Beryl M762 (Katta damage) 💣"],
-            ["5+ K/D (Kibersportchi) 🏆", "3 - 5 K/D (Tajribali) ⚡️", "1.5 - 3 K/D (O'rtacha) 🎯", "1 dan past (Erkakcha rush qilaman) 😂"],
-            ["Erangel (Pochinki, Sosnovka) 🌲", "Sanhok (Butkemp, Paradise) 🌴", "Livik (Tezkor matchlar) ⚡️", "Miramar / Boshqa 🏜"]
+            ["M416 🎯", "DBS / Shotgun 🔥", "UZI / Vector ⚡️"],
+            ["Faqat rush 🔥", "Pana joy (Cover) 🛡", "Snayper (Uzoqdan) 🎯"],
+            ["Erangel 🌲", "Livik ⚡️", "Sanhok 🌴"],
+            ["Telefon 📱", "iPad / Planshet 📟", "Emulyator 🖥"]
         ]
 
     # 5. Universal / Boshqa sohalar
@@ -2957,8 +2965,8 @@ MUHIM TALABLAR:
 2. Dastlabki 1-2 qatorda diqqatni tortuvchi kuchli sarlavha (Hook / Pattern Interrupt).
 3. Asosiy qism: qisqa, bo'limlarga bo'lingan, ortiqcha suvsiz mazmun.
 4. Matn shriftlari faqat Telegram ruxsat bergan HTML teglari bilan: qalin (<b>...</b>), muhim jumlalar (<i>...</i>), parametr va kodlar (<code>...</code>). Hech qachon <br>, <p>, <div> ishlatma!
-5. poll_question: Aynan «{c['title']}» kanali mavzusi ({c['niche']}) bo'yicha 1 ta o'ta qiziq so'rovnoma savoli (maksimal 200 belgi).
-6. poll_options: Ushbu savolga mos 3-4 ta takrorlanmas variant.
+5. poll_question: JUDA QISQA (30-60 belgi), lo'nda va darhol qiziqish uyg'otuvchi so'rovnoma savoli. Uzun matnlar qat'iyan taqiqlanadi!
+6. poll_options: Faqat 3 ta juda qisqa variant (har biri 2-4 so'z, emojilar bilan). Masalan: ["Ha, albatta! 🔥", "Yo'q, hali 🤔", "Sinab ko'raman 💡"].
 {img_style_line}
 
 Javobni FAQAT toza JSON formatida qaytar:
@@ -2973,8 +2981,8 @@ Javobni FAQAT toza JSON formatida qaytar:
     # 5. Gemini API chaqiruvi: Rasmiy Google Search Grounding vositasi
     # (Alohida yangi API kalit shart emas, mavjud GEMINI_API_KEY bilan ishlaydi)
     client = get_gemini_client()
-    # Rasmiy Google Search Grounding vositasi (@google/genai types.Tool(google_search=...))
-    gemini_tools = [genai_types.Tool(google_search=genai_types.GoogleSearch())] if has_grounding else None
+    # Rasmiy Google Search Grounding vositasi (Google'dan eng so'nggi real faktlarni olish)
+    gemini_tools = [genai_types.Tool(google_search=genai_types.GoogleSearch())]
     models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash", GEMINI_MODEL, "gemini-3.8-flash", "gemini-flash-latest"]
 
     for m in models_to_try:
@@ -3674,30 +3682,44 @@ async def group_handler(m: types.Message):
     replied = m.reply_to_message and m.reply_to_message.from_user and m.reply_to_message.from_user.id == me.id
     mentioned = f"@{me.username.lower()}" in text_content.lower()
     
-    if replied or mentioned:
+    # 2-AI CHAT: Guruhdagi muloqotni faol kuzatish va jonli odamdek javob berish
+    is_question = any(w in text_content.lower() for w in [
+        "?", "qanday", "qaysi", "nima", "qanaqa", "kim", "qayerda", "kerak",
+        "maslahat", "yordam", "fikr", "necha", "aytvor", "aytvorilar", "tushuntir",
+        "biladi", "bormi", "bo'ladimi", "qilsam", "muammo", "xato", "ochmayapti"
+    ])
+    is_greeting = any(w in text_content.lower() for w in ["salom", "assalom", "qalaysiz", "qalesilar", "tuzikmisiz", "charchamang"])
+
+    should_respond = replied or mentioned or is_question or (is_greeting and len(text_content) < 25)
+
+    if should_respond and len(text_content.strip()) > 3:
         clean_query = re.sub(f"@{me.username}", "", text_content, flags=re.I).strip()
+        niche_desc = c['niche'] if c else "Texnologiya, geyming va internet loyihalari"
+        
         system_prompt = (
-            f"Sen ushbu guruhning oliy toifali, juda xushmuomala ekspert yordamchisisan.\n"
-            f"Kanal yo'nalishi: {c['niche'] if c else 'Dasturlash, texnologiya va internet loyihalari'}.\n\n"
-            "Qoidalar:\n"
-            "- O'zbek tilida, do'stona, qisqa (2-4 gap) va aniq foydali javob ber.\n"
-            "- Shriftlarni chiroyli formatla: qalin <b>...</b>, kodlar <code>...</code>.\n"
-            "- O'zingni AI deb atama, mutaxassis sifatida gapir."
+            f"Sen ushbu guruhning juda samimiy, xushmuomala, tirishqoq va jonli inson ekspertisan.\n"
+            f"Guruh va kanal yo'nalishi: {niche_desc}.\n\n"
+            "MUHIM QOIDALAR:\n"
+            "- Xuddi yonida o'tirgan do'stingdek, nihoyatda SODDA va JONLI o'zbek tilida gapir.\n"
+            "- Gaplaring qisqa (2-3 jumla), aniq va amaliy foydali bo'lsin.\n"
+            "- Agar savol geyming/PUBG haqida bo'lsa, haqiqiy geymer tilida (M416, sens, drop, rush, aptechka) do'stona maslahat ber.\n"
+            "- O'zingni 'AI', 'bot' yoki 'sun'iy intellekt' deb HECH QACHON atama! Haqiqiy inson moderatordek javob ber.\n"
+            "- Telegram formati: muhim so'zlarni <b>...</b> yoki <code>...</code> qil."
         )
-        ai_prompt = f"Foydalanuvchi savoli: {clean_query}"
+        ai_prompt = f"Foydalanuvchi ({user.first_name if user else 'Foydalanuvchi'}): {clean_query}"
         ans = ""
         
-        # 1. Eng tezkor Groq AI orqali javob olish (0.3 soniyada)
+        # 1. Tezkor Groq AI
         try:
             ans = await ask_groq_ai(ai_prompt, system_prompt=system_prompt)
-        except Exception as e_groq:
-            logging.warning(f"Groq javob xatosi: {e_groq}")
+        except Exception:
+            pass
             
-        # 2. Agar Groq javob bermasa -> Gemini AI zaxirasi
+        # 2. Gemini AI zaxirasi
         if not ans:
             try:
                 client = get_gemini_client()
-                for m_try in ["gemini-3.8-flash", GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash"]:
+                for m_try in ["gemini-2.5-flash", GEMINI_MODEL, "gemini-1.5-flash"]:
                     try:
                         r = await client.aio.models.generate_content(model=m_try, contents=f"{system_prompt}\n\n{ai_prompt}")
                         ans = (r.text or "").strip()
@@ -3705,27 +3727,15 @@ async def group_handler(m: types.Message):
                             break
                     except Exception:
                         continue
-            except Exception as e:
-                logging.warning(f"Gemini fallback xatosi: {e}")
+            except Exception:
+                pass
                 
         if ans:
             try:
-                await m.reply(ans)
+                await m.reply(ans, parse_mode=ParseMode.HTML)
             except Exception:
                 clean_ans = re.sub(r"<[^>]+>", "", ans)
                 await m.reply(clean_ans, parse_mode=None)
-        else:
-            await m.reply("Savolingiz uchun katta rahmat! 🤝 Tez orada bu bo'yicha batafsil ma'lumot beramiz ✨")
-    else:
-        u_name = html.escape(user.first_name if user else "do'stim")
-        gratitude_responses = [
-            f"Fikringiz uchun katta rahmat, <b>{u_name}</b>! 🤝 Ushbu mavzuni kanalimizda ham tez orada yoritamiz ✨",
-            f"Ajoyib fikr! 💡 Buni albatta inobatga olamiz, rahmat!",
-            f"Savol va qiziqishingiz uchun rahmat! 🚀 Kanalimizni kuzatib boring, yangi foydali ma'lumotlar tayyorlanmoqda.",
-            f"Fikr almashganingiz uchun minnatdormiz! 🤝 Bilim ulashishda davom etamiz."
-        ]
-        if any(w in text_content.lower() for w in ["qanday", "qaysi", "nima", "kerak", "maslahat", "yordam", "fikr", "loyiha", "bot", "sayt"]):
-            await m.reply(random.choice(gratitude_responses))
 
 
 # ============================ KANAL QO'SHILISH HODISALARI ============================
@@ -4617,40 +4627,67 @@ async def give_rep_selected(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
 
+class GiveawayFSM(StatesGroup):
+    mode = State()
+    repeat_interval = State()
+    reward_type = State()
+    amount = State()
+    code_and_site = State()
+    winners_count = State()
+    channel = State()
+
 @dp.callback_query(F.data.startswith("give_rew:"))
 async def give_rew_selected(cb: types.CallbackQuery, state: FSMContext):
     rew_type = cb.data.split(":")[1]
     await state.update_data(reward_type=rew_type)
-    await state.set_state(GiveawayFSM.amount_and_code)
+    await state.set_state(GiveawayFSM.amount)
 
     if rew_type == "uc":
         text = (
-            "🎮 <b>PUBG UC SOVRIN MA'LUMOTLARINI KIRITING:</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-            "Format: <code>[Miqdor] | [UC vaucher kodi]</code>\n\n"
-            "Masalan:\n<code>60 UC | ABCD-1234-EFGH</code>\n\n"
-            "<i>(Agar bir nechta g'olib bo'lsa, kodlarni vergul bilan yozing)</i>"
+            "🎮 <b>PUBG UC MIQDORINI YOZING:</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            "Sovrin sifatida necha UC bermoqchisiz?\n\n"
+            "Masalan: <code>60 UC</code> yoki <code>325 UC</code> yoki <code>660 UC</code>"
         )
     else:
         text = (
-            "🎟 <b>PROMO-KOD MA'LUMOTLARINI KIRITING:</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-            "Format: <code>[Sayt/O'yin] | [Promo-kod matni]</code>\n\n"
-            "Masalan:\n<code>midasbuy.com | PROMO2026NEW</code>"
+            "🎟 <b>PROMO-KOD NOMLANISHI VA MIQDORINI YOZING:</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            "Masalan: <code>100 000 so'm vaucher</code> yoki <code>50% chegirma kodi</code>"
         )
     await cb.message.edit_text(text)
     await cb.answer()
 
-@dp.message(GiveawayFSM.amount_and_code, F.text)
-async def give_amount_code_proc(m: types.Message, state: FSMContext):
+@dp.message(GiveawayFSM.amount, F.text)
+async def give_amount_proc(m: types.Message, state: FSMContext):
     txt = m.text.strip()
     if txt.casefold() in {"/cancel", "cancel", "bekor"}:
         await state.clear()
         return await m.answer("Bekor qilindi.", reply_markup=MENU)
 
-    parts = [p.strip() for p in txt.split("|")]
-    if len(parts) < 2:
-        return await m.answer("❌ Noto'g'ri format! O'rtasiga | (vertikal chiziq) qo'yib yuboring:\nMasalan: <code>60 UC | KOD123</code>")
+    await state.update_data(amount=txt)
+    await state.set_state(GiveawayFSM.code_and_site)
+    
+    data = await state.get_data()
+    if data.get("reward_type") == "uc":
+        await m.answer(
+            "🔑 <b>ENDI UC VAUCHER KODI VA KIRITISH SAYTINI YUBORING:</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            "G'olib bo'lgan odamga taqdim etiladigan vaucher kodi va saytni yozing:\n\n"
+            "Masalan: <code>ABCD-1234-EFGH (midasbuy.com)</code>\n"
+            "<i>(Agar bir nechta g'olib bo'lsa, kodlarni vergul bilan yozing)</i>"
+        )
+    else:
+        await m.answer(
+            "🔑 <b>ENDI PROMO-KOD VA FAQLLASHTIRISH SAYTINI YUBORING:</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            "Masalan: <code>NEW2026 (sayt.uz)</code>"
+        )
 
-    await state.update_data(amount=parts[0], codes=parts[1], site=parts[0] if "http" in parts[0] or ".com" in parts[0] else "midasbuy.com")
+@dp.message(GiveawayFSM.code_and_site, F.text)
+async def give_code_site_proc(m: types.Message, state: FSMContext):
+    txt = m.text.strip()
+    if txt.casefold() in {"/cancel", "cancel", "bekor"}:
+        await state.clear()
+        return await m.answer("Bekor qilindi.", reply_markup=MENU)
+
+    await state.update_data(codes=txt, site="midasbuy.com" if "midas" in txt.lower() else "rasmiy sayt")
     await state.set_state(GiveawayFSM.winners_count)
     kb = ik(
         [("1 kishi", "give_win:1"), ("2 kishi", "give_win:2"), ("3 kishi", "give_win:3")],
@@ -4666,6 +4703,10 @@ async def give_win_selected(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(GiveawayFSM.channel)
 
     user_chs = q("SELECT channel_id, title FROM channels WHERE owner_id=? AND active=1", (cb.from_user.id,))
+    if not user_chs:
+        await state.clear()
+        return await cb.message.edit_text("❌ Sizda faol ulangan kanallar topilmadi. Avval kanal ulang!")
+
     buttons = []
     for c in user_chs:
         buttons.append([(f"📢 {c['title']}", f"give_ch:{c['channel_id']}")])
@@ -4678,44 +4719,86 @@ async def give_win_selected(cb: types.CallbackQuery, state: FSMContext):
 async def give_channel_selected(cb: types.CallbackQuery, state: FSMContext):
     channel_id = int(cb.data.split(":")[1])
     data = await state.get_data()
+    
+    # Ma'lumotlarni xavfsiz olish
+    reward_type = data.get("reward_type", "uc")
+    amount = data.get("amount", "Sovrin")
+    codes = data.get("codes", "")
+    site = data.get("site", "midasbuy.com")
+    winners_count = data.get("winners_count", 1)
+    mode = data.get("mode", "once")
+    repeat_interval = data.get("repeat_interval", "none")
+
     await state.clear()
+    wait_msg = await cb.message.answer("⏳ <b>Kanal tekshirilmoqda va sovrin posti tayyorlanmoqda...</b>")
 
     now = datetime.now(TZ)
     ends_at = now + timedelta(days=1)
     bot_info = await bot.me()
 
+    # 1. Botning kanalda adminligini tekshirish
+    try:
+        chat_member = await bot.get_chat_member(channel_id, bot_info.id)
+        if chat_member.status not in ("creator", "administrator") or not getattr(chat_member, "can_post_messages", True):
+            await wait_msg.delete()
+            return await cb.message.answer(
+                f"❌ <b>Xatolik:</b> Bot ushbu kanalda administrator emas yoki xabar yuborish (Post messages) huquqi yo'q!\n\n"
+                f"Iltimos, Telegram kanal sozlamalariga kirib botga admin huquqini bering va qayta urinib ko'ring."
+            )
+    except Exception as e_adm:
+        logging.warning(f"Kanal admin tekshiruvi: {e_adm}")
+
+    # 2. Bazaga saqlash
     q("""INSERT INTO giveaways (
             creator_id, channel_id, reward_type, amount, codes, site,
             winners_count, mode, repeat_interval, status, created_at, ends_at
          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-      (cb.from_user.id, channel_id, data["reward_type"], data["amount"], data["codes"],
-       data.get("site", ""), data["winners_count"], data["mode"], data["repeat_interval"],
-       "active", now.isoformat(), ends_at.isoformat()), commit=True)
+      (cb.from_user.id, channel_id, reward_type, amount, codes, site,
+       winners_count, mode, repeat_interval, "active", now.isoformat(), ends_at.isoformat()), commit=True)
 
     g_id = q("SELECT last_insert_rowid() id", one=True)["id"]
 
-    # Post to channel
+    # 3. Kanalga xavfsiz post chiqarish
     post_text = (
         f"🎁 <b>DIQQAT: KANALIMIZDA SOVRINLI O'YIN (GIVEAWAY)!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎮 <b>Sovrin:</b> <b>{html.escape(data['amount'])}</b>\n"
-        f"👥 <b>G'oliblar soni:</b> <b>{data['winners_count']} kishi</b>\n"
+        f"🎮 <b>Sovrin:</b> <b>{html.escape(amount)}</b>\n"
+        f"👥 <b>G'oliblar soni:</b> <b>{winners_count} kishi</b>\n"
         f"⏱ <b>Tugash vaqti:</b> <code>{fmt(ends_at)}</code> (24 soat)\n\n"
-        f"🔥 <i>Sovrinda ishtirok etish mutlaqo bepul! Pastdagi tugmani bosing va botimizga kiring:</i>"
+        f"🔥 <i>Ishtirok etish mutlaqo bepul! Pastdagi tugmani bosing va botimizga kiring:</i>"
     )
     join_btn = ik([("🎁 Sovringa qo'shilish", f"https://t.me/{bot_info.username}?start=give_{g_id}")])
 
+    sent_success = False
     try:
-        sent_m = await bot.send_message(channel_id, post_text, reply_markup=join_btn)
+        sent_m = await bot.send_message(channel_id, post_text, reply_markup=join_btn, parse_mode=ParseMode.HTML)
         q("UPDATE giveaways SET post_message_id=? WHERE id=?", (sent_m.message_id, g_id), commit=True)
+        sent_success = True
+    except Exception as e_html:
+        logging.warning(f"Giveaway HTML jo'natish xatosi ({e_html}), toza matnda qayta urinish...")
+        try:
+            clean_text = re.sub(r"<[^>]+>", "", post_text)
+            sent_m = await bot.send_message(channel_id, clean_text, reply_markup=join_btn, parse_mode=None)
+            q("UPDATE giveaways SET post_message_id=? WHERE id=?", (sent_m.message_id, g_id), commit=True)
+            sent_success = True
+        except Exception as e_clean:
+            await wait_msg.delete()
+            return await cb.message.answer(
+                f"❌ <b>Kanalga post chiqarishda xatolik yuz berdi:</b>\n<code>{html.escape(str(e_clean))}</code>\n\n"
+                f"⚠️ Bot kanalda administrator ekanligiga va xabar yuborish huquqi borligiga ishonch hosil qiling."
+            )
+
+    await wait_msg.delete()
+    if sent_success:
         await cb.message.answer(
-            f"🎉 <b>Sovrinli o'yin muvaffaqiyatli boshlandi va kanalga yuborildi!</b>\n\n"
-            f"Kanal a'zolari tugmani bosib botga kirishi bilan ro'yxatga olinadi. "
-            f"Vaqti tugagach bot avtomatik g'oliblarni aniqlaydi va kanalga e'lon qiladi!",
+            f"🎉 <b>Sovrinli o'yin muvaffaqiyatli yaratildi va kanalingizga yuborildi!</b>\n\n"
+            f"🎁 <b>Sovrin:</b> <b>{html.escape(amount)}</b>\n"
+            f"👥 <b>G'oliblar:</b> {winners_count} kishi\n"
+            f"⏱ <b>Muddati:</b> 24 soat\n\n"
+            f"Kanal a'zolari tugmani bosib botga kirishi bilan avtomatik ro'yxatga olinadi. "
+            f"Vaqti tugagach bot o'zi tasodifiy g'oliblarni aniqlaydi va kanalga tabrik e'lonini chiqaradi!",
             reply_markup=MENU
         )
-    except Exception as e:
-        await cb.message.answer(f"❌ Kanalga post chiqarishda xato: {e}\nBot kanalda administrator ekanligini tekshiring.")
     await cb.answer()
 
 @dp.callback_query(F.data == "give_cancel")
